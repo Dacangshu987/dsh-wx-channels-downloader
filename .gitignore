@@ -1,0 +1,14 @@
+node_modules/
+*.log
+.DS_Store
+Thumbs.db
+
+# local runtime data never belongs in the repo
+certs/
+downloads/
+*.db
+*.db-shm
+*.db-wal
+
+# scratch / ad-hoc
+test/tmp/

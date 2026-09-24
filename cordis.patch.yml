@@ -1,0 +1,10 @@
+# dsh-wx-channels-downloader bundle patch: inserts the plugin row into the
+# web profile roster. One package, two halves:
+#   - node half (exports "."): probe service, local MITM proxy (port 2023),
+#     injection/capture, downloader with ISAAC64 decrypt + dedup, web API.
+#   - browser half (exports "./client"): the wxdown console panel opened from
+#     the composer tool button.
+# Install with: dsh plugin --profile web add link:<repo>/dsh-wx-channels-downloader
+- insert:
+    - id: wx-channels-downloader
+      name: dsh-wx-channels-downloader

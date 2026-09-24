@@ -1,0 +1,785 @@
+/**
+ * @file 下载功能模块
+ */
+console.log('[download.js] 加载下载模块');
+
+function __wx_channels_load_script_once__(src) {
+  return new Promise(function (resolve, reject) {
+    var existing = document.querySelector('script[data-wx-src="' + src + '"]');
+    if (existing) {
+      if (existing.getAttribute('data-loaded') === '1') {
+        resolve();
+        return;
+      }
+      existing.addEventListener('load', function () { resolve(); }, { once: true });
+      existing.addEventListener('error', function (ev) { reject(ev || new Error('script load failed')); }, { once: true });
+      return;
+    }
+
+    var script = document.createElement('script');
+    script.type = 'text/javascript';
+    script.src = src;
+    script.setAttribute('data-wx-src', src);
+    script.onload = function () {
+      script.setAttribute('data-loaded', '1');
+      resolve();
+    };
+    script.onerror = function (ev) {
+      reject(ev || new Error('script load failed: ' + src));
+    };
+    document.head.appendChild(script);
+  });
+}
+
+async function __wx_channels_ensure_saveas__() {
+  if (typeof window.saveAs === 'function') return;
+
+  var lastErr = null;
+  var candidates = [
+    '/FileSaver.min.js',
+    'https://res.wx.qq.com/t/wx_fed/cdn_libs/res/FileSaver.min.js'
+  ];
+
+  for (var i = 0; i < candidates.length; i++) {
+    var src = candidates[i];
+    try {
+      __wx_log({ msg: '🌐 加载保存组件<' + src + '>' });
+      await __wx_channels_load_script_once__(src);
+      if (typeof window.saveAs === 'function') return;
+    } catch (err) {
+      lastErr = err;
+      __wx_log({ msg: '⚠️ 保存组件加载失败<' + src + '>' });
+    }
+  }
+
+  throw lastErr || new Error('saveAs is unavailable');
+}
+
+// ==================== 进度条显示 ====================
+async function show_progress_or_loaded_size(response) {
+  var content_length = response.headers.get("Content-Length");
+  var chunks = [];
+  var total_size = content_length ? parseInt(content_length, 10) : 0;
+
+  var progressBarId = 'progress-' + Date.now();
+  var progressBarHTML = '<div id="' + progressBarId + '" style="position: fixed; top: 20px; left: 50%; transform: translateX(-50%); z-index: 10000; background: rgba(0,0,0,0.7); border-radius: 8px; padding: 15px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); color: white; font-size: 14px; min-width: 280px; text-align: center;">' +
+    '<div style="margin-bottom: 12px; font-weight: bold;">视频下载中</div>' +
+    '<div class="progress-container" style="background: rgba(255,255,255,0.2); height: 10px; border-radius: 5px; overflow: hidden; margin-bottom: 10px;">' +
+    '<div class="progress-bar" style="height: 100%; width: 0%; background: #07c160; transition: width 0.3s;"></div></div>' +
+    '<div class="progress-details" style="display: flex; justify-content: space-between; font-size: 12px; opacity: 0.8;">' +
+    '<span class="progress-size">准备下载...</span><span class="progress-speed"></span></div></div>';
+
+  var progressBarContainer = document.createElement('div');
+  progressBarContainer.innerHTML = progressBarHTML;
+  document.body.appendChild(progressBarContainer.firstElementChild);
+
+  var progressBar = document.querySelector('#' + progressBarId + ' .progress-bar');
+  var progressSize = document.querySelector('#' + progressBarId + ' .progress-size');
+  var progressSpeed = document.querySelector('#' + progressBarId + ' .progress-speed');
+
+  var loaded_size = 0;
+  var reader = response.body.getReader();
+  var lastUpdate = Date.now();
+  var lastLoaded = 0;
+
+  while (true) {
+    var result = await reader.read();
+    if (result.done) break;
+
+    chunks.push(result.value);
+    loaded_size += result.value.length;
+
+    var currentTime = Date.now();
+    if (currentTime - lastUpdate > 200) {
+      var percent = total_size ? (loaded_size / total_size * 100) : 0;
+      if (progressBar) progressBar.style.width = percent + '%';
+
+      if (total_size) {
+        progressSize.textContent = formatFileSize(loaded_size) + ' / ' + formatFileSize(total_size);
+      } else {
+        progressSize.textContent = '已下载: ' + formatFileSize(loaded_size);
+      }
+
+      var timeElapsed = (currentTime - lastUpdate) / 1000;
+      if (timeElapsed > 0) {
+        var currentSpeed = (loaded_size - lastLoaded) / timeElapsed;
+        progressSpeed.textContent = formatFileSize(currentSpeed) + '/s';
+      }
+
+      lastLoaded = loaded_size;
+      lastUpdate = currentTime;
+    }
+  }
+
+  var progressElement = document.getElementById(progressBarId);
+  if (progressElement) {
+    setTimeout(function () {
+      progressElement.style.opacity = '0';
+      progressElement.style.transition = 'opacity 0.5s';
+      setTimeout(function () { progressElement.remove(); }, 500);
+    }, 1000);
+  }
+
+  __wx_log({ msg: '下载完成，文件总大小<' + formatFileSize(loaded_size) + '>' });
+
+  return new Blob(chunks);
+}
+
+function __wx_channels_parse_video_size__(value) {
+  if (typeof value === 'number') {
+    return isFinite(value) && value > 0 ? Math.round(value) : 0;
+  }
+
+  var text = String(value || '').trim();
+  if (!text) return 0;
+
+  var match = text.match(/^([0-9]+(?:\.[0-9]+)?)\s*(B|KB|MB|GB)?$/i);
+  if (!match) return 0;
+
+  var number = Number(match[1]);
+  if (!isFinite(number) || number <= 0) return 0;
+
+  var unit = (match[2] || 'B').toUpperCase();
+  var multiplier = unit === 'GB' ? 1024 * 1024 * 1024
+    : unit === 'MB' ? 1024 * 1024
+      : unit === 'KB' ? 1024
+        : 1;
+  return Math.round(number * multiplier);
+}
+
+function __wx_channels_get_expected_video_size__(profile) {
+  if (!profile) return 0;
+
+  var media = profile.media || {};
+  var candidates = [
+    media.fullFileSize,
+    media.duplicateFileSize,
+    profile.fullFileSize,
+    media.fileSize,
+    media.cdnFileSize,
+    profile.fileSize,
+    profile.size
+  ];
+
+  for (var i = 0; i < candidates.length; i++) {
+    var size = __wx_channels_parse_video_size__(candidates[i]);
+    if (size > 0) return size;
+  }
+  return 0;
+}
+
+function __wx_channels_validate_original_video_size__(expectedSize, actualSize) {
+  var expected = __wx_channels_parse_video_size__(expectedSize);
+  var actual = __wx_channels_parse_video_size__(actualSize);
+  var expectedLabel = expected > 0 ? formatFileSize(expected) : 'unknown';
+  var actualLabel = actual > 0 ? formatFileSize(actual) : 'unknown';
+
+  __wx_log({ msg: '📏 原始视频大小校验<期望=' + expectedLabel + ' 实际=' + actualLabel + '>' });
+
+  // A source-size hint is approximate, but a stream below 80% is a clear
+  // signal that the CDN returned a lower-quality rendition.
+  if (expected > 0 && actual > 0 && actual < expected * 0.8) {
+    throw new Error('页面直连返回疑似低码率流: 期望 ' + expectedLabel + '，实际 ' + actualLabel);
+  }
+}
+
+// ==================== 下载函数 ====================
+
+// 浏览器直连无法获知用户实际的下载目录，因此使用与后端相同的标题预算；
+// 后端会在已知作者目录后进一步按完整路径收紧预算。
+var __WX_CHANNELS_MAX_DOWNLOAD_FILENAME_BODY_UTF16__ = 180;
+
+function __wx_channels_clean_download_filename__(filename) {
+  var cleaned = String(filename == null ? '' : filename)
+    .replace(/<[^>]*>/g, '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;|&#39;/gi, "'")
+    .replace(/&#34;/gi, '"')
+    .replace(/&[a-zA-Z0-9#]+;/g, '')
+    .replace(/[<>:"/\\|?*\u0000-\u001f\u007f]/g, '_')
+    .trim()
+    .replace(/[ .]+$/g, '');
+
+  return cleaned || ('video_' + Date.now());
+}
+
+function __wx_channels_truncate_download_filename_utf16__(value, maxUnits) {
+  var text = String(value == null ? '' : value);
+  if (maxUnits <= 0) return '';
+  if (text.length <= maxUnits) return text;
+
+  var end = maxUnits;
+  var code = text.charCodeAt(end - 1);
+  if (code >= 0xd800 && code <= 0xdbff) end -= 1;
+  return text.slice(0, end);
+}
+
+function __wx_channels_prepare_download_filename__(filename, requiredSuffix, extension) {
+  var cleaned = __wx_channels_clean_download_filename__(filename);
+  var suffix = String(requiredSuffix || '');
+  var ext = String(extension || '');
+  var lowerCleaned = cleaned.toLowerCase();
+  var lowerExt = ext.toLowerCase();
+
+  if (ext && lowerCleaned.slice(-lowerExt.length) === lowerExt) {
+    cleaned = cleaned.slice(0, cleaned.length - ext.length);
+  }
+
+  var base = cleaned;
+  if (suffix && base.slice(-suffix.length) !== suffix) suffix = '';
+
+  var title = suffix ? base.slice(0, base.length - suffix.length) : base;
+  title = __wx_channels_truncate_download_filename_utf16__(
+    title,
+    __WX_CHANNELS_MAX_DOWNLOAD_FILENAME_BODY_UTF16__
+  ).replace(/[ .]+$/g, '');
+
+  if (!title && !suffix) title = 'video';
+  return title + suffix;
+}
+
+/** 下载非加密视频 */
+async function __wx_channels_download2(profile, filename, expectedSize) {
+  console.log("__wx_channels_download2");
+  try {
+    __wx_log({ msg: '🌐 正在加载保存组件...' });
+    await __wx_channels_ensure_saveas__();
+    __wx_log({ msg: '🚀 正在发起页面直连请求...' });
+    var response = await fetch(profile.url);
+    if (!response || response.ok === false) {
+      throw new Error('页面直连 HTTP ' + (response && response.status ? response.status : 'unknown'));
+    }
+    __wx_log({
+      msg: '📡 页面直连响应<status=' + response.status + ' length=' + (response.headers.get('Content-Length') || 'unknown') + ' type=' + (response.headers.get('Content-Type') || '') + ' range=' + (response.headers.get('Content-Range') || '') + '>'
+    });
+    var blob = await show_progress_or_loaded_size(response);
+    __wx_log({ msg: '📦 页面抓流大小<' + formatFileSize(blob.size) + '>' });
+    __wx_channels_validate_original_video_size__(expectedSize || __wx_channels_get_expected_video_size__(profile), blob.size);
+    __wx_log({ msg: '💾 正在保存视频文件...' });
+    saveAs(blob, filename + ".mp4");
+    __wx_log({ msg: '✓ 页面直连保存完成' });
+  } catch (err) {
+    __wx_log({ msg: '❌ 页面直连下载失败<' + (err && err.message ? err.message : err) + '>' });
+    throw err;
+  }
+}
+
+/** 下载图片 */
+async function __wx_channels_download3(profile, filename) {
+  console.log("__wx_channels_download3");
+  await __wx_load_script("https://res.wx.qq.com/t/wx_fed/cdn_libs/res/FileSaver.min.js");
+  await __wx_load_script("https://res.wx.qq.com/t/wx_fed/cdn_libs/res/jszip.min.js");
+
+  var zip = new JSZip();
+  zip.file("contact.txt", JSON.stringify(profile.contact, null, 2));
+  var folder = zip.folder("images");
+
+  var fetchPromises = profile.files.map(function (f, index) {
+    return fetch(f.url).then(function (response) {
+      return response.blob();
+    }).then(function (blob) {
+      folder.file((index + 1) + ".png", blob);
+    });
+  });
+
+  try {
+    await Promise.all(fetchPromises);
+    var content = await zip.generateAsync({ type: "blob" });
+    saveAs(content, filename + ".zip");
+  } catch (err) {
+    __wx_log({ msg: "下载失败\n" + err.message });
+  }
+}
+
+/** 下载加密视频 */
+async function __wx_channels_download4(profile, filename, expectedSize) {
+  console.log("__wx_channels_download4");
+  try {
+    __wx_log({ msg: '🌐 正在加载保存组件...' });
+    await __wx_channels_ensure_saveas__();
+
+    if (profile.key && !profile.decryptor_array) {
+      __wx_log({ msg: '🔑 正在生成解密数组...' });
+      console.log('🔑 检测到加密key，正在生成解密数组...');
+      profile.decryptor_array = await __wx_channels_decrypt(profile.key);
+    }
+
+    __wx_log({ msg: '🚀 正在发起页面直连请求...' });
+    var response = await fetch(profile.url);
+    if (!response || response.ok === false) {
+      throw new Error('页面直连 HTTP ' + (response && response.status ? response.status : 'unknown'));
+    }
+    __wx_log({
+      msg: '📡 页面直连响应<status=' + response.status + ' length=' + (response.headers.get('Content-Length') || 'unknown') + ' type=' + (response.headers.get('Content-Type') || '') + ' range=' + (response.headers.get('Content-Range') || '') + '>'
+    });
+    var blob = await show_progress_or_loaded_size(response);
+    __wx_log({ msg: '📦 页面抓流大小<' + formatFileSize(blob.size) + '>' });
+    __wx_channels_validate_original_video_size__(expectedSize || __wx_channels_get_expected_video_size__(profile), blob.size);
+
+    var array = new Uint8Array(await blob.arrayBuffer());
+    if (profile.decryptor_array) {
+      __wx_log({ msg: '🔐 正在解密视频...' });
+      console.log('🔐 开始解密视频');
+      array = __wx_channels_video_decrypt(array, 0, profile);
+      console.log('✓ 视频解密完成');
+    }
+
+    var result = new Blob([array], { type: "video/mp4" });
+    __wx_log({ msg: '💾 正在保存视频文件...' });
+    saveAs(result, filename + ".mp4");
+    __wx_log({ msg: '✓ 页面直连保存完成' });
+  } catch (err) {
+    __wx_log({ msg: '❌ 页面直连下载失败<' + (err && err.message ? err.message : err) + '>' });
+    throw err;
+  }
+}
+
+function __wx_channels_export_current_raw_json__() {
+  var store = window.__wx_channels_store__ || {};
+  var profile = store.profile || null;
+  var rawFeed = store.rawFeed || null;
+  var rawProfile = store.rawProfile || profile || null;
+
+  if (!rawFeed && !rawProfile) {
+    __wx_log({ msg: '❌ 当前没有可导出的原始视频数据' });
+    alert('当前没有可导出的原始视频数据');
+    return;
+  }
+
+  var payload = {
+    exportedAt: new Date().toISOString(),
+    pageUrl: location.href,
+    profile: rawProfile,
+    rawFeed: rawFeed
+  };
+
+  var title = (profile && (profile.title || profile.id)) || 'current_video';
+  var safeTitle = String(title)
+    .replace(/[\\/:*?"<>|]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80) || 'current_video';
+
+  var blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement('a');
+  a.href = url;
+  a.download = safeTitle + '_raw.json';
+  a.click();
+  URL.revokeObjectURL(url);
+
+  __wx_log({ msg: '📤 已导出当前视频原始数据 JSON' });
+}
+
+function __wx_channels_get_true_original_url__(profile) {
+  if (!profile) return '';
+
+  var media = profile.media || {};
+  var candidates = [
+    media.fullUrl,
+    media.fullURL,
+    profile.fullUrl,
+    profile.fullURL
+  ];
+
+  for (var i = 0; i < candidates.length; i++) {
+    var candidate = String(candidates[i] || '').trim();
+    if (/^https?:\/\//i.test(candidate)) return candidate;
+  }
+  return '';
+}
+
+function __wx_channels_has_true_original__(profile) {
+  // A size hint alone describes the source asset; it does not prove that the
+  // CDN returned a downloadable original URL.
+  return !!__wx_channels_get_true_original_url__(profile);
+}
+
+function __wx_channels_get_best_available_spec__(profile) {
+  var specs = profile && Array.isArray(profile.spec) ? profile.spec : [];
+  var best = null;
+  var bestScore = -1;
+
+  for (var i = 0; i < specs.length; i++) {
+    var spec = specs[i];
+    if (!spec || !spec.fileFormat) continue;
+
+    var videoBitrate = Number(spec.videoBitrate || 0);
+    var audioBitrate = Number(spec.audioBitrate || 0);
+    var bitRate = videoBitrate + audioBitrate;
+    if (bitRate <= 0) bitRate = Number(spec.bitRate || 0);
+
+    // xWT111 is the stable highest-quality fallback on the current desktop
+    // feed; keep it ahead of codec-specific bitrate hints when present.
+    var format = String(spec.fileFormat);
+    var score = bitRate > 0 ? bitRate : 0;
+    if (format === 'xWT111') score += 1000000000000;
+    if (!best || score > bestScore || (score === bestScore && format === 'xWT111')) {
+      best = spec;
+      bestScore = score;
+    }
+  }
+
+  return best;
+}
+
+function __wx_channels_primary_download_label__(profile) {
+  if (__wx_channels_has_true_original__(profile)) return '原始视频';
+
+  var best = __wx_channels_get_best_available_spec__(profile);
+  if (best && best.fileFormat) return '最高可用画质 (' + best.fileFormat + ')';
+  return '原始流不可用';
+}
+
+function __wx_channels_append_query_param__(url, key, value) {
+  if (!url || !key) return url || '';
+
+  var separator = url.indexOf('?') >= 0 ? '&' : '?';
+  return url + separator + key + '=' + encodeURIComponent(value);
+}
+
+function __wx_channels_remove_legacy_original_marker__(rawUrl) {
+  var source = String(rawUrl || '').trim();
+  if (!source || source.indexOf('X-snsvideoflag=original') < 0) return source;
+
+  try {
+    var baseOrigin = window.location && window.location.origin ? window.location.origin : 'http://localhost';
+    var parsed = new URL(source, baseOrigin);
+    if (parsed.searchParams.get('X-snsvideoflag') !== 'original') return source;
+    parsed.searchParams.delete('X-snsvideoflag');
+    return parsed.toString();
+  } catch (err) {
+    __wx_log({ msg: '⚠️ 旧版原始视频标记清理失败<' + (err && err.message ? err.message : err) + '>' });
+    return source;
+  }
+}
+
+function __wx_channels_get_profile_video_dimensions__(profile) {
+  var media = profile && profile.media ? profile.media : {};
+  var width = Number((profile && profile.width) || media.fullWidth || media.width || 0);
+  var height = Number((profile && profile.height) || media.fullHeight || media.height || 0);
+
+  return {
+    width: width > 0 ? width : 0,
+    height: height > 0 ? height : 0
+  };
+}
+
+function __wx_channels_join_video_url_parts__(baseUrl, urlToken) {
+  var base = String(baseUrl || '').trim();
+  var token = String(urlToken || '').trim();
+  if (!base) return token;
+  if (!token) return base;
+  if (/^https?:\/\//i.test(token)) return token;
+  if (token.charAt(0) === '?' || token.charAt(0) === '&') {
+    return base + (/[?&]$/.test(base) ? token.substring(1) : token);
+  }
+  return base + (/[?&]$/.test(base) ? '' : '&') + token;
+}
+
+function __wx_channels_video_url_score__(rawUrl) {
+  var source = String(rawUrl || '').trim();
+  if (!source) return 0;
+
+  var signatureKeys = {
+    encfilekey: true,
+    token: true,
+    basedata: true,
+    sign: true,
+    web: true,
+    extg: true,
+    svrbypass: true,
+    svrnonce: true
+  };
+
+  try {
+    var baseOrigin = window.location && window.location.origin ? window.location.origin : 'http://localhost';
+    var parsed = new URL(source, baseOrigin);
+    var score = 0;
+    parsed.searchParams.forEach(function (value, key) {
+      if (!value || key === 'X-snsvideoflag') return;
+      score += signatureKeys[key] ? 100 : 1;
+    });
+    return score;
+  } catch (err) {
+    var query = source.indexOf('?') >= 0 ? source.substring(source.indexOf('?') + 1) : '';
+    return query ? query.split('&').filter(function (part) { return part; }).length : 0;
+  }
+}
+
+function __wx_channels_select_video_url__(profile) {
+  if (!profile) return '';
+
+  var candidates = [];
+  function addCandidate(value) {
+    var candidate = String(value || '').trim();
+    if (candidate) candidates.push(candidate);
+  }
+
+  addCandidate(profile.url);
+  addCandidate(__wx_channels_join_video_url_parts__(profile.originalUrl, profile.urlToken));
+  addCandidate(profile.originalUrl);
+
+  var media = profile.media || {};
+  addCandidate(media.url);
+  addCandidate(__wx_channels_join_video_url_parts__(media.url, media.urlToken));
+  addCandidate(media.fullUrl || media.fullURL);
+  addCandidate(profile.fullUrl || profile.fullURL);
+
+  var selected = '';
+  var selectedScore = 0;
+  for (var i = 0; i < candidates.length; i++) {
+    var score = __wx_channels_video_url_score__(candidates[i]);
+    if (!selected || score > selectedScore) {
+      selected = candidates[i];
+      selectedScore = score;
+    }
+  }
+  return selected;
+}
+
+function __wx_channels_normalize_video_download__(profile, spec) {
+  var normalized = {
+    mode: 'original',
+    url: '',
+    resolution: '',
+    width: 0,
+    height: 0,
+    fileFormat: '',
+    qualityInfo: '',
+    useDirectDownload: true,
+    spec: spec || null
+  };
+
+  if (!profile) {
+    return normalized;
+  }
+
+  var originalCandidate = __wx_channels_remove_legacy_original_marker__(
+    __wx_channels_get_true_original_url__(profile) || __wx_channels_select_video_url__(profile)
+  );
+  // Preserve the complete signed CDN URL; the server remains the compatibility owner.
+  normalized.url = originalCandidate;
+
+  var explicitSpec = spec && spec.fileFormat ? spec : null;
+  if (explicitSpec) {
+    normalized.mode = 'specific';
+    normalized.fileFormat = explicitSpec.fileFormat || '';
+    normalized.width = Number(explicitSpec.width || 0);
+    normalized.height = Number(explicitSpec.height || 0);
+    normalized.qualityInfo = normalized.fileFormat;
+
+    if (normalized.width > 0 && normalized.height > 0) {
+      normalized.resolution = normalized.width + 'x' + normalized.height;
+      normalized.qualityInfo += '_' + normalized.resolution;
+    }
+
+    normalized.url = __wx_channels_append_query_param__(originalCandidate, 'X-snsvideoflag', normalized.fileFormat);
+    normalized.useDirectDownload = false;
+    return normalized;
+  }
+
+  var originalDimensions = __wx_channels_get_profile_video_dimensions__(profile);
+  normalized.width = originalDimensions.width;
+  normalized.height = originalDimensions.height;
+  if (normalized.width > 0 && normalized.height > 0) {
+    normalized.resolution = normalized.width + 'x' + normalized.height;
+  }
+
+  return normalized;
+}
+
+function __wx_channels_normalize_batch_video_download__(profile) {
+  var spec = null;
+  if (!__wx_channels_has_true_original__(profile)) {
+    spec = __wx_channels_get_best_available_spec__(profile);
+  }
+  return __wx_channels_normalize_video_download__(profile, spec);
+}
+
+async function __wx_channels_download_via_backend__(profile, filename, normalized) {
+  var authorName = profile.nickname || (profile.contact && profile.contact.nickname) || '未知作者';
+  var hasKey = !!(profile.key && profile.key.length > 0);
+  var expectedSize = normalized.mode === 'original'
+    ? __wx_channels_get_expected_video_size__(profile)
+    : 0;
+  var requestData = {
+    videoUrl: profile.url,
+    videoId: profile.id || '',
+    // 文件名是落盘投影，数据库和下载记录应保留原始标题。
+    title: profile.title || profile.id || filename,
+    author: authorName,
+    sourceUrl: location.href,
+    userAgent: navigator.userAgent || '',
+    headers: {
+      'Referer': location.href,
+      'Origin': location.origin || 'https://channels.weixin.qq.com'
+    },
+    key: profile.key || '',
+    forceSave: false,
+    resolution: normalized.resolution,
+    width: normalized.width,
+    height: normalized.height,
+    fileFormat: normalized.fileFormat,
+    expectedSize: expectedSize,
+    likeCount: profile.likeCount || 0,
+    commentCount: profile.commentCount || 0,
+    forwardCount: profile.forwardCount || 0,
+    favCount: profile.favCount || 0
+  };
+
+  var headers = { 'Content-Type': 'application/json' };
+  if (window.__WX_LOCAL_TOKEN__) {
+    headers['X-Local-Auth'] = window.__WX_LOCAL_TOKEN__;
+  }
+
+  __wx_log({ msg: '📥 开始后端回退下载: ' + filename.substring(0, 30) + '...' });
+  var response = await fetch('/__wx_channels_api/download_video', {
+    method: 'POST',
+    headers: headers,
+    body: JSON.stringify(requestData)
+  });
+
+  var data = null;
+  try {
+    data = await response.json();
+  } catch (err) {
+    throw new Error('后端下载响应不是有效 JSON');
+  }
+
+  if (!response.ok || !data || !data.success) {
+    throw new Error((data && (data.error || data.message)) || ('HTTP ' + response.status));
+  }
+
+  var msg = data.skipped
+    ? '⏭️ 文件已存在，跳过下载'
+    : (data.started ? '⏳ 后端下载任务已在后台启动' : (hasKey ? '✓ 视频已下载并解密' : '✓ 视频已下载'));
+  __wx_log({ msg: msg });
+  return data;
+}
+
+// ==================== 点击下载处理 ====================
+async function __wx_channels_handle_click_download__(spec) {
+  var profile = __wx_channels_store__.profile;
+  if (!profile) {
+    alert("检测不到视频，请将本工具更新到最新版");
+    return;
+  }
+
+  var hasTrueOriginal = __wx_channels_has_true_original__(profile);
+  if (!spec && !hasTrueOriginal) {
+    spec = __wx_channels_get_best_available_spec__(profile);
+    if (!spec) {
+      __wx_log({ msg: '❌ 微信当前未提供原始流或可用画质' });
+      alert('微信当前未提供原始视频流，无法下载');
+      return;
+    }
+    __wx_log({ msg: '⚠️ 微信未提供原始流，改用最高可用画质<' + spec.fileFormat + '>' });
+  }
+
+  var filename = profile.title || profile.id || String(new Date().valueOf());
+  var _profile = Object.assign({}, profile);
+  var normalized = __wx_channels_normalize_video_download__(profile, spec);
+  _profile.url = normalized.url;
+  var qualitySuffix = '';
+
+  if (normalized.qualityInfo) {
+    qualitySuffix = "_" + __wx_channels_clean_download_filename__(normalized.qualityInfo);
+    filename = filename + qualitySuffix;
+  }
+
+  __wx_log({ msg: '下载模式<' + normalized.mode + '>' });
+  __wx_log({ msg: '视频链接<' + _profile.url + '>' });
+
+  if (_profile.type === "picture") {
+    filename = __wx_channels_prepare_download_filename__(filename, '', '');
+    __wx_log({ msg: '下载文件名<' + filename + '>' });
+    __wx_channels_download3(_profile, filename);
+    return;
+  }
+
+  filename = __wx_channels_prepare_download_filename__(filename, qualitySuffix, '.mp4');
+  __wx_log({ msg: '下载文件名<' + filename + '>' });
+
+  if (!_profile.url) {
+    alert("视频URL为空，无法下载");
+    return;
+  }
+
+  var expectedSize = hasTrueOriginal ? __wx_channels_get_expected_video_size__(_profile) : 0;
+  if (normalized.useDirectDownload) {
+    __wx_log({ msg: '📎 原始视频使用页面会话直连<期望=' + (expectedSize > 0 ? formatFileSize(expectedSize) : 'unknown') + '>' });
+    try {
+      if (!_profile.key) {
+        await __wx_channels_download2(_profile, filename, expectedSize);
+      } else {
+        await __wx_channels_download4(_profile, filename, expectedSize);
+      }
+      return;
+    } catch (err) {
+      __wx_log({ msg: '⚠️ 页面直连未通过原始视频校验，回退后端<' + (err && err.message ? err.message : err) + '>' });
+    }
+  }
+
+  try {
+    await __wx_channels_download_via_backend__(_profile, filename, normalized);
+  } catch (error) {
+    __wx_log({ msg: '❌ 下载视频失败: ' + (error && error.message ? error.message : error) });
+    alert('下载失败: ' + (error && error.message ? error.message : error));
+  }
+}
+
+// ==================== 封面下载 ====================
+async function __wx_channels_handle_download_cover() {
+  var profile = __wx_channels_store__.profile;
+  if (!profile) {
+    alert("未找到视频信息");
+    return;
+  }
+
+  var coverUrl = profile.thumbUrl || profile.fullThumbUrl || profile.coverUrl;
+  if (!coverUrl) {
+    alert("未找到封面图片");
+    return;
+  }
+
+  __wx_log({ msg: '正在保存封面到服务器...' });
+
+  var requestData = {
+    coverUrl: coverUrl,
+    videoId: profile.id || '',
+    title: profile.title || '',
+    author: profile.nickname || (profile.contact && profile.contact.nickname) || '未知作者',
+    forceSave: false
+  };
+
+  var headers = { 'Content-Type': 'application/json' };
+  if (window.__WX_LOCAL_TOKEN__) {
+    headers['X-Local-Auth'] = window.__WX_LOCAL_TOKEN__;
+  }
+
+  fetch('/__wx_channels_api/save_cover', {
+    method: 'POST',
+    headers: headers,
+    body: JSON.stringify(requestData)
+  })
+    .then(function (response) { return response.json(); })
+    .then(function (data) {
+      if (data.success) {
+        __wx_log({ msg: '✓ ' + (data.message || '封面已保存') });
+      } else {
+        __wx_log({ msg: '❌ ' + (data.error || '保存封面失败') });
+        alert('保存封面失败: ' + (data.error || '未知错误'));
+      }
+    })
+    .catch(function (error) {
+      __wx_log({ msg: '❌ 保存封面失败: ' + error.message });
+      alert("保存封面失败: " + error.message);
+    });
+}
+
+console.log('[download.js] 下载模块加载完成');
