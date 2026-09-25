@@ -16,3 +16,4 @@ test/tmp/
 # Go sidecar: build artifact + synced assets are generated (source lives in sidecar/*.go)
 sidecar/wxchannels-inject.exe
 sidecar/assets/
+sidecar/*.exe~
