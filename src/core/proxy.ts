@@ -16,9 +16,13 @@ export interface MitmHooks {
   handleLocalApi(req: http.IncomingMessage, res: http.ServerResponse): Promise<boolean> | boolean
   /** Return rewritten body (may change content-type) or null to pass through unchanged. */
   interceptResponse(host: string, pathname: string, contentType: string, body: Buffer): Buffer | null
+  /** A JS/HTML response exceeded the intercept budget and is passed through unpatched. */
+  onInterceptSkip?(pathname: string, declared: number): void
 }
 
-const MAX_INTERCEPT_BYTES = 8 * 1024 * 1024
+// The Go reference has no size cap on intercepted bodies; keep the budget
+// generous so large finder bundles still get patched.
+const MAX_INTERCEPT_BYTES = 32 * 1024 * 1024
 
 export class MitmServer {
   private server: http.Server | null = null
@@ -116,6 +120,10 @@ export class MitmServer {
     })
     inner.listen(0, '127.0.0.1', () => {
       inner.emit('connection', tlsSocket)
+      // The inner server is only used as a connection sink; stop listening
+      // immediately or every CONNECT leaks an ephemeral listener for the
+      // process lifetime.
+      inner.close()
     })
   }
 
@@ -125,14 +133,15 @@ export class MitmServer {
       const handled = await this.hooks.handleLocalApi(req, res)
       if (handled) return
     }
-    if (hostOf(req) !== 'channels.weixin.qq.com') {
-      // Foreign inner request (should not happen on the MITM'd host) — tunnel it.
-      const tunnel = net.connect(443, hostOf(req) || 'channels.weixin.qq.com')
-      tunnel.on('connect', () => {
-        req.pipe(tunnel)
-        tunnel.pipe(res)
-      })
-      tunnel.on('error', () => res.destroy())
+    if (!this.mitmHosts.has(hostOf(req))) {
+      // The CONNECT target was in the MITM set, so a request whose Host is
+      // outside it is unexpected (misbehaving client). Refuse rather than
+      // forward — piping raw bytes to an arbitrary host would be wrong.
+      try {
+        res.writeHead(421).end()
+      } catch {
+        // ignore
+      }
       return
     }
     await this.forward(req, res)
@@ -158,6 +167,9 @@ export class MitmServer {
           const wantIntercept = ct.includes('text/html') || ct.includes('javascript') || ct.includes('ecmascript')
           const declared = Number(outRes.headers['content-length'] ?? 0)
           if (!wantIntercept || (declared > 0 && declared > MAX_INTERCEPT_BYTES)) {
+            if (wantIntercept && declared > MAX_INTERCEPT_BYTES) {
+              this.hooks.onInterceptSkip?.(pathname, declared)
+            }
             res.writeHead(outRes.statusCode ?? 502, outRes.headers)
             outRes.pipe(res)
             return resolve()

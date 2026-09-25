@@ -17,8 +17,11 @@ const candidates = [
 ]
 const srcDir = candidates.find((p) => existsSync(p))
 if (!srcDir) {
-  console.error('[copy-assets] vendored inject sources not found under:', candidates)
-  process.exit(1)
+  // The vendored checkout is an upstream-refresh convenience, not a build
+  // requirement: assets/inject is committed with the repo.
+  console.warn('[copy-assets] vendored inject sources not found under:', candidates)
+  console.warn('[copy-assets] keeping the committed assets/inject as-is; continuing build')
+  process.exit(0)
 }
 
 const destDir = join(pluginRoot, 'assets', 'inject')

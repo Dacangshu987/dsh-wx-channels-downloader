@@ -41,7 +41,9 @@ dsh plugin --profile web add link:D:/ds-harness-test/cz/wxdown/dsh-wx-channels-d
 ## 验证
 
 - `npm run typecheck` / `npm run build`（tsc 服务端 + esbuild 客户端）
-- `node test/decrypt-equivalence.mjs`：ISAAC64 解密与 P0 实测验证过的 sphDecrypt 实现逐字节一致（含真实 key）
+- `npm test`：冒烟测试（`test/smoke.mjs`，20 项，覆盖本地 API 鉴权、MITM 隧道、注入补丁三种 bundle 形态与 ISAAC64 加解密）+ 下载器功能测试（`test/downloader-test.mjs`，7 项）
+- `npm run test:decrypt`：`test/decrypt-equivalence.mjs`，ISAAC64 解密与 P0 实测验证过的 sphDecrypt 实现逐字节一致（含真实 key）。**注意**：该用例需要 `dist/main/main/services/sphDecrypt.js`（P0 参考实现产物），未提供时无法运行
+- 冒烟测试需要 `openssl` 在 PATH 中（用于生成一次性自签证书；Git for Windows 自带 `C:\Program Files\Git\usr\bin\openssl.exe`）
 
 ## 风险与合规
 

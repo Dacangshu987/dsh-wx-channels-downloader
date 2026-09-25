@@ -1,0 +1,4 @@
+* text=auto
+# Generated build output: never renormalize line endings (stops lib/ churn)
+lib/**/* -text
+package-lock.json -text

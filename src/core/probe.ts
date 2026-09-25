@@ -3,10 +3,12 @@
  * cache. This powers the "打开插件 -> 运行探测" step and the checklist the
  * client renders, mirroring the reference's runtime diagnostics.
  */
-import { readFileSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs'
+import { dirname } from 'node:path'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { CA_CN } from '../config.js'
+import { proxyBackupPath } from './paths.js'
 import { isCaInstalled } from './cert.js'
 import { existingCacheDir } from './wechat.js'
 import { isWechatInstalled, isWechatRunning } from './wechat.js'
@@ -46,7 +48,6 @@ export interface ProbeDeps {
 
 export interface ProbeOutput {
   result: ProbeResult
-  wechatExe: string | null
 }
 
 export async function runProbe(deps: ProbeDeps): Promise<ProbeOutput> {
@@ -104,26 +105,81 @@ export async function runProbe(deps: ProbeDeps): Promise<ProbeOutput> {
     cachePending: cacheDir !== null,
     items,
   }
-  return { result, wechatExe: wechatInstalled ? 'found' : null }
+  return { result }
 }
 
-/** Persist the system proxy config (HKCU WinINET only; Chromium webviews honor it). */
+/** Persist the system proxy config (HKCU WinINET only; Chromium webviews honor it).
+ *  Enabling saves the user's previous settings once; disabling restores them
+ *  instead of blindly turning the proxy off (which would wipe e.g. Clash). */
 export async function setSystemProxy(port: number, on: boolean): Promise<{ ok: boolean; error?: string }> {
   try {
+    if (on) {
+      const current = await readWinInetProxy()
+      const ours = `127.0.0.1:${port}`
+      const backup = readProxyBackup()
+      if (!backup && !(current.enabled && current.server.includes(ours))) {
+        writeProxyBackup({ enabled: current.enabled, server: current.server })
+      }
+      const script = `
+$p = '${INTERNET_SETTINGS}'
+New-Item -Path $p -Force | Out-Null
+Set-ItemProperty -Path $p -Name ProxyEnable -Value 1
+Set-ItemProperty -Path $p -Name ProxyServer -Value '${ours}'
+Write-Output 'ok'
+`
+      await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script], { windowsHide: true, maxBuffer: 1024 * 1024 })
+      return { ok: true }
+    }
+
+    const backup = readProxyBackup()
+    const server = backup?.server ?? ''
+    const enabled = backup?.enabled ? 1 : 0
     const script = `
 $p = '${INTERNET_SETTINGS}'
-if (${on ? '1' : '0'}) {
-  New-Item -Path $p -Force | Out-Null
-  Set-ItemProperty -Path $p -Name ProxyEnable -Value 1
-  Set-ItemProperty -Path $p -Name ProxyServer -Value '127.0.0.1:${port}'
+if ('${server.replaceAll("'", "''")}' -ne '') {
+  Set-ItemProperty -Path $p -Name ProxyServer -Value '${server.replaceAll("'", "''")}'
 } else {
-  Set-ItemProperty -Path $p -Name ProxyEnable -Value 0 -ErrorAction SilentlyContinue
+  Remove-ItemProperty -Path $p -Name ProxyServer -ErrorAction SilentlyContinue
 }
+Set-ItemProperty -Path $p -Name ProxyEnable -Value ${enabled}
 Write-Output 'ok'
 `
     await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script], { windowsHide: true, maxBuffer: 1024 * 1024 })
+    clearProxyBackup()
     return { ok: true }
   } catch (e) {
     return { ok: false, error: (e as Error).message }
+  }
+}
+
+interface ProxyBackup {
+  enabled: boolean
+  server: string
+}
+
+function readProxyBackup(): ProxyBackup | null {
+  try {
+    const raw = JSON.parse(readFileSync(proxyBackupPath(), 'utf8')) as Partial<ProxyBackup>
+    if (typeof raw.server !== 'string' || typeof raw.enabled !== 'boolean') return null
+    return { enabled: raw.enabled, server: raw.server }
+  } catch {
+    return null
+  }
+}
+
+function writeProxyBackup(b: ProxyBackup): void {
+  try {
+    mkdirSync(dirname(proxyBackupPath()), { recursive: true })
+    writeFileSync(proxyBackupPath(), JSON.stringify(b, null, 2), 'utf8')
+  } catch {
+    // best effort; worst case the restore falls back to ProxyEnable=0
+  }
+}
+
+function clearProxyBackup(): void {
+  try {
+    rmSync(proxyBackupPath(), { force: true })
+  } catch {
+    // ignore
   }
 }

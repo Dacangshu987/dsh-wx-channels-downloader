@@ -22,6 +22,11 @@ export function recordsDbPath(): string {
   return join(dataHome(), 'records.db')
 }
 
+/** Where setSystemProxy persists the user's previous WinINET proxy settings. */
+export function proxyBackupPath(): string {
+  return join(dataHome(), 'proxy-backup.json')
+}
+
 export function caCertPath(): string {
   return join(certsDir(), 'wxdown-ca.cer')
 }

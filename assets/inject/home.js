@@ -690,15 +690,17 @@ function __publish_home_profile(profile, feed, reason) {
       window.__wx_channels_store__.profile = profile;
     }
 
+    var __localHeaders = { 'Content-Type': 'application/json', 'X-Local-Auth': window.__WX_LOCAL_TOKEN__ || '' };
+
     fetch('/__wx_channels_api/profile', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: __localHeaders,
       body: JSON.stringify(profile)
     }).catch(function () { });
 
     fetch('/__wx_channels_api/tip', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: __localHeaders,
       body: JSON.stringify({ msg: '📹 ' + (profile.nickname || '未知作者') + ' - ' + (profile.title || '').substring(0, 30) + '...' })
     }).catch(function () { });
   }

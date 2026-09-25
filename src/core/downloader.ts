@@ -4,14 +4,17 @@
  * {downloads}/{作者}/{标题}_{质量}.mp4. Mirrors the reference
  * download_video handler (fetch + decrypt + dedup + per-author folder).
  */
-import { createWriteStream, existsSync, mkdirSync, renameSync, rmSync, statSync } from 'node:fs'
+import { createWriteStream, existsSync, mkdirSync, openSync, readSync, closeSync, renameSync, rmSync, statSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
-import { Readable } from 'node:stream'
+import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
-import { decryptFileInPlace, DECRYPT_PREFIX_LEN } from './isaac64.js'
+import { decryptFileInPlace, DECRYPT_PREFIX_LEN, isEncryptedMp4 } from './isaac64.js'
 import type { Hub } from './events.js'
 import type { Store } from './store.js'
 import type { WxVideo } from '../shared/protocol.js'
+
+/** Abort the transfer when no bytes (nor headers) arrive for this long. */
+const STALL_TIMEOUT_MS = 60_000
 
 export interface DownloadOutcome {
   started: boolean
@@ -125,6 +128,15 @@ export class Downloader {
     this.setTask(v.id, { title: v.title, nickname: v.nickname, username: v.username, createtime: v.createtime, state: 'downloading', progress: 0, startAt: started })
     this.hub.emitDownload({ videoId: v.id, title: v.title, nickname: v.nickname, username: v.username, createtime: v.createtime, state: 'downloading', progress: 0 })
     const tmpPath = join(dirname(this.downloadsDir), `.tmp-${v.id}-${Date.now()}.mp4`)
+    // Watchdog: no bytes (or headers) for STALL_TIMEOUT_MS aborts the fetch.
+    const controller = new AbortController()
+    let stallTimer: NodeJS.Timeout | undefined
+    const touch = (): void => {
+      clearTimeout(stallTimer)
+      stallTimer = setTimeout(() => {
+        controller.abort(new Error(`下载停滞：${STALL_TIMEOUT_MS / 1000}s 未收到数据`))
+      }, STALL_TIMEOUT_MS)
+    }
     try {
       const headers: Record<string, string> = {
         Origin: 'https://channels.weixin.qq.com',
@@ -135,14 +147,32 @@ export class Downloader {
       if (v.username && v.nickname) {
         headers['X-Requested-With'] = 'wxdown'
       }
-      const controller = new AbortController()
+      touch()
       const res = await fetch(v.url, { headers, redirect: 'follow', signal: controller.signal })
       if (!res.ok || !res.body) {
         throw new Error(`HTTP ${res.status} ${res.statusText}`)
       }
       const total = Number(res.headers.get('content-length') ?? 0)
+      let received = 0
+      let lastPct = 0
+      const counter = new Transform({
+        transform: (chunk: Buffer, _enc, cb) => {
+          touch()
+          received += chunk.length
+          if (total > 0) {
+            const pct = Math.min(99, Math.floor((received / total) * 100))
+            if (pct >= lastPct + 5) {
+              lastPct = pct
+              this.setTaskProgress(v.id, pct)
+              this.hub.emitDownload({ videoId: v.id, title: v.title, nickname: v.nickname, username: v.username, createtime: v.createtime, state: 'downloading', progress: pct })
+            }
+          }
+          cb(null, chunk)
+        },
+      })
       await pipeline(
         Readable.fromWeb(res.body as import('node:stream/web').ReadableStream),
+        counter,
         createWriteStream(tmpPath),
       )
       let size = statSync(tmpPath).size
@@ -151,6 +181,8 @@ export class Downloader {
       if (v.key) {
         const r = decryptFileInPlace(tmpPath, DECRYPT_PREFIX_LEN, BigInt(v.key))
         if (!r.ok) throw new Error(`解密失败: ${r.error}`)
+      } else {
+        this.warnIfStillEncrypted(tmpPath, v.title || v.id)
       }
 
       const authorFolder = cleanFilename(v.nickname || '未知作者', 60)
@@ -181,10 +213,38 @@ export class Downloader {
       } catch {
         // ignore
       }
-      const message = err instanceof Error ? err.message : String(err)
+      const abortReason = controller.signal.aborted && controller.signal.reason instanceof Error
+        ? (controller.signal.reason as Error).message
+        : undefined
+      const message = abortReason ?? (err instanceof Error ? err.message : String(err))
       this.setTask(v.id, { title: v.title, nickname: v.nickname, username: v.username, createtime: v.createtime, state: 'failed', progress: 0, error: message, endAt: Date.now() })
       this.hub.emitDownload({ videoId: v.id, title: v.title, nickname: v.nickname, username: v.username, createtime: v.createtime, state: 'failed', progress: 0, error: message })
       this.hub.emitLog(`✗ 下载失败: ${v.title?.slice(0, 40)} — ${message}`)
+    } finally {
+      clearTimeout(stallTimer)
+    }
+  }
+
+  private setTaskProgress(id: string, pct: number): void {
+    const t = this.tasks.get(id)
+    if (t) t.progress = pct
+  }
+
+  /** Best-effort diagnosis: no decode key captured, and the file doesn't look like a plain mp4. */
+  private warnIfStillEncrypted(path: string, title: string): void {
+    try {
+      const head = Buffer.alloc(16)
+      const fd = openSync(path, 'r')
+      try {
+        readSync(fd, head, 0, head.length, 0)
+      } finally {
+        closeSync(fd)
+      }
+      if (isEncryptedMp4(head)) {
+        this.hub.emitLog(`⚠️ 「${title.slice(0, 40)}」未捕获解密 key 且文件头不是 ftyp —— 可能仍是密文，请重新打开博主主页采集后再试`)
+      }
+    } catch {
+      // probe only
     }
   }
 }

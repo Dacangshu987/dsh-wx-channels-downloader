@@ -36,11 +36,12 @@ export class WxChannelsService {
   readonly hub = new Hub()
   private store: Store
   private downloader: Downloader
-  private injector = new Injector()
+  private injector = new Injector((msg) => this.hub.emitLog(msg))
   private proxy: MitmServer | null = null
   private downloadsDir: string
   private lastProbe: ProbeResult | null = null
-  private wechatExe: string | null = null
+  /** Whether WE turned the system proxy on (and therefore should restore it on stop). */
+  private proxyEnabledByUs = false
   private currentUrl = ''
 
   constructor(private readonly cfg: ConfigType) {
@@ -69,12 +70,14 @@ export class WxChannelsService {
         isLocalApiPath: (pathname) => pathname.startsWith('/__wx_channels_api/'),
         handleLocalApi: (req, res) => handleLocalApi(this.localApiContext(), req, res),
         interceptResponse: (host, pathname, contentType, body) => this.interceptResponse(host, pathname, contentType, body),
+        onInterceptSkip: (pathname, declared) => this.hub.emitLog(`⚠️ ${pathname} 响应过大（${Math.round(declared / 1024)}KB），未注入补丁直接透传`),
       },
     )
     await this.proxy.start()
     if (this.cfg.autoSetProxy) {
       const r = await setSystemProxy(this.cfg.port, true)
       if (!r.ok) this.hub.emitLog(`⚠️ 设置系统代理失败: ${r.error}`)
+      else this.proxyEnabledByUs = true
     }
     this.hub.emitLog(`✅ 代理已启动: 127.0.0.1:${this.cfg.port}（微信视频号流量经此注入）`)
     this.hub.emitLog('▶ 打开 PC 微信，进入任一博主主页，即可自动探测视频列表')
@@ -86,8 +89,9 @@ export class WxChannelsService {
       await this.proxy.stop()
       this.proxy = null
     }
-    if (this.cfg.autoSetProxy) {
+    if (this.proxyEnabledByUs) {
       await setSystemProxy(this.cfg.port, false)
+      this.proxyEnabledByUs = false
     }
     this.store.close()
   }
@@ -99,7 +103,6 @@ export class WxChannelsService {
       recordsCount: () => this.store.listDownloads().length,
     })
     this.lastProbe = out.result
-    this.wechatExe = out.wechatExe
     if (emit) this.hub.emitProbe(out.result)
     return out.result
   }
@@ -266,12 +269,14 @@ export class WxChannelsService {
           await this.ensureStarted()
           await this.refreshProbe(true)
           return { ok: true }
-        case 'setProxy':
+        case 'setProxy': {
           // The proxy must be listening before the system proxy points at it.
           await this.ensureStarted()
-          await setSystemProxy(this.cfg.port, Boolean(payload.on))
+          const r = await setSystemProxy(this.cfg.port, Boolean(payload.on))
+          if (r.ok) this.proxyEnabledByUs = Boolean(payload.on)
           await this.refreshProbe(true)
-          return { ok: true }
+          return { ok: r.ok, error: r.error }
+        }
         case 'clearCache': {
           const r = await clearCache()
           this.hub.emitLog(r.cleaned.length ? `🧹 已清理缓存 ${r.cleaned.length} 个目录，请重启微信` : '缓存目录不存在，无需清理')

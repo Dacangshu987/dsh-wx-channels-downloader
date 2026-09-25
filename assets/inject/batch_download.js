@@ -437,7 +437,7 @@ function __export_batch_video_list__() {
     var _username = (_mgr.context && _mgr.context.username) || '';
     fetch('/__wx_channels_api/save_video_list', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: __wx_channels_batch_api_headers__(),
       body: JSON.stringify({ username: _username, author: _author, videos: exportData })
     }).catch(function (e) { console.error('[wxdown] save_video_list 失败', e); });
   } catch (e) { console.error('[wxdown] 自动落库失败', e); }

@@ -50,7 +50,7 @@ function __wx_channel_loading() {
 function __wx_log(msg) {
   fetch("/__wx_channels_api/tip", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-Local-Auth": window.__WX_LOCAL_TOKEN__ || "" },
     body: JSON.stringify(msg),
   });
 }
