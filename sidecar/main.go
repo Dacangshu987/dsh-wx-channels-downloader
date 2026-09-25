@@ -15,6 +15,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
+	"time"
 
 	"github.com/qtgolang/SunnyNet/SunnyNet"
 	"github.com/qtgolang/SunnyNet/public"
@@ -108,6 +110,20 @@ func handleRequest(conn *SunnyNet.HttpConn) {
 	}
 }
 
+func writeStatus(injected bool, port int, pid int) {
+	path := os.Getenv("WXCHANNELS_STATUS_FILE")
+	if path == "" {
+		path = filepath.Join(os.TempDir(), "wxchannels-inject.status")
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"pid":      pid,
+		"port":     port,
+		"injected": injected,
+		"at":       time.Now().Unix(),
+	})
+	_ = os.WriteFile(path, payload, 0644)
+}
+
 func main() {
 	port := 2026
 	if len(os.Args) > 1 && os.Args[1] == "-p" && len(os.Args) > 2 {
@@ -118,15 +134,18 @@ func main() {
 	err := sunny.Start().Error
 	if err != nil {
 		logln("proxy start error: %v", err)
+		writeStatus(false, port, os.Getpid())
 		os.Exit(1)
 	}
 	sunny.SetGoCallback(handleRequest, nil, nil, nil)
 	sunny.ProcessAddName("WeChatAppEx.exe")
-	if ok := sunny.StartProcess(); ok {
+	injected := sunny.StartProcess()
+	if injected {
 		logln("✅ 进程注入成功: WeChatAppEx.exe (port %d)", port)
 	} else {
 		logln("⚠️ 进程注入失败（需要管理员权限）")
 	}
+	writeStatus(injected, port, os.Getpid())
 	logln("运行中，Ctrl+C 退出")
 	select {}
 }

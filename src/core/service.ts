@@ -3,7 +3,8 @@
  * probe/wechat helpers into one lifecycle the plugin apply() drives.
  */
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import net from 'node:net'
 import { fileURLToPath } from 'node:url'
@@ -30,6 +31,7 @@ const PLUGIN_ROOT = dirname(fileURLToPath(import.meta.url)) + '/../..'
 export interface ServiceDiagnostics {
   proxyRunning: boolean
   proxyPort: number
+  processInjection: boolean
   downloadsDir: string
   catalogCount: number
   downloadCount: number
@@ -181,6 +183,7 @@ export class WxChannelsService {
     return {
       proxyRunning: this.proxy !== null,
       proxyPort: this.cfg.port,
+      processInjection: this.cfg.processInjection,
       downloadsDir: this.downloadsDir,
       catalogCount: catalog.length,
       downloadCount: this.store.listDownloads().length,
@@ -280,31 +283,65 @@ export class WxChannelsService {
     return this.portOpen(SIDECAR_PORT)
   }
 
+  private statusFile(): string {
+    return join(tmpdir(), 'wxchannels-inject.status')
+  }
+
+  private async readSidecarStatus(): Promise<{ injected?: boolean; pid?: number; port?: number } | null> {
+    try {
+      const raw = readFileSync(this.statusFile(), 'utf8')
+      return JSON.parse(raw) as { injected?: boolean; pid?: number; port?: number }
+    } catch {
+      return null
+    }
+  }
+
+  private async isAdmin(): Promise<boolean> {
+    try {
+      const { execFileAsync } = await import('./certUtil.js')
+      const out = await execFileAsync(
+        'powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-Command', '([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)'],
+        { windowsHide: true, maxBuffer: 1024 * 1024 },
+      )
+      return /true/i.test(out.stdout)
+    } catch {
+      return false
+    }
+  }
+
   private async spawnSidecar(): Promise<void> {
     const exe = this.sidecarExe()
     if (!existsSync(exe)) {
       this.hub.emitLog(`⚠️ 未找到 sidecar 可执行文件: ${exe}（先运行 npm run build）`)
       return
     }
-    // 1) 先尝试直接启动（宿主本身已管理员时有效）
-    const child = spawn(exe, ['-p', String(SIDECAR_PORT)], { detached: true, stdio: 'ignore' })
-    child.unref()
-    await delay(1500)
-    if (await this.isSidecarAlive()) {
-      this.hub.emitLog(`✅ sidecar 注入器已运行 (127.0.0.1:${SIDECAR_PORT})`)
-      return
+    const admin = await this.isAdmin()
+    if (admin) {
+      // 宿主已是管理员：直接启动
+      const child = spawn(exe, ['-p', String(SIDECAR_PORT)], { detached: true, stdio: 'ignore' })
+      child.unref()
+      this.hub.emitLog('🧬 已直接启动 sidecar（宿主具备管理员权限）')
+    } else {
+      // 非管理员：直接启动只会绑定端口但注入失败 → 直接走 UAC 提权
+      this.hub.emitLog('⏫ 以管理员权限启动 sidecar —— 请在 UAC 弹窗中点“是”')
+      const ps = spawn(
+        'powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-Command', `Start-Process -Verb RunAs -FilePath '${exe}' -ArgumentList '-p ${SIDECAR_PORT}'`],
+        { detached: true, stdio: 'ignore' },
+      )
+      ps.unref()
     }
-    // 2) 未检测到 → 以管理员权限启动（弹出 UAC，请允许）
-    this.hub.emitLog('⏫ sidecar 未检测到监听，将以管理员权限启动（请在 UAC 弹窗中点“是”）')
-    const ps = spawn(
-      'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-Command', `Start-Process -Verb RunAs -FilePath '${exe}' -ArgumentList '-p ${SIDECAR_PORT}'`],
-      { detached: true, stdio: 'ignore' },
-    )
-    ps.unref()
     await delay(2500)
-    if (await this.isSidecarAlive()) this.hub.emitLog(`✅ sidecar 注入器已运行 (127.0.0.1:${SIDECAR_PORT})`)
-    else this.hub.emitLog('⚠️ sidecar 仍未运行：可能 UAC 被拒绝，或杀软拦截；请手动以管理员运行 sidecar/wxchannels-inject.exe')
+    const alive = await this.isSidecarAlive()
+    const st = await this.readSidecarStatus()
+    if (alive && st?.injected) {
+      this.hub.emitLog(`✅ sidecar 注入器已运行并注入成功 (127.0.0.1:${SIDECAR_PORT})`)
+    } else if (alive) {
+      this.hub.emitLog('⚠️ sidecar 端口已开但注入未生效（可能非管理员运行，或 WeChatAppEx 尚未启动）—— 请用管理员重新启动')
+    } else {
+      this.hub.emitLog('⚠️ sidecar 未运行：UAC 可能被拒绝或杀软拦截；可手动以管理员运行 sidecar/wxchannels-inject.exe')
+    }
   }
 
   /** Client-driven commands. */

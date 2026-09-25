@@ -31,6 +31,7 @@ interface StateJson {
   ok: boolean
   proxyRunning: boolean
   proxyPort: number
+  processInjection?: boolean
   downloadsDir: string
   catalogCount: number
   downloadCount: number
@@ -206,7 +207,11 @@ function WxChannelsConsole({ onClose }: { onClose: () => void }) {
           <span style={{ fontSize: 17 }}>🎬</span>
           <span style={{ fontWeight: 600, fontSize: 14 }}>微信视频号下载</span>
           <span style={{ fontSize: 12, color: state?.proxyRunning ? '#22c55e' : '#ef4444' }}>
-            {state ? `代理 ${state.proxyRunning ? `运行中 (127.0.0.1:${state.proxyPort})` : '未启动'}` : '连接中…'}
+            {state
+              ? state.processInjection
+                ? `🧬 注入器 ${state.lastProbe?.items?.find((i) => i.id === 'sidecar')?.status === 'ok' ? '运行中' : '未启动'}`
+                : `代理 ${state.proxyRunning ? `运行中 (127.0.0.1:${state.proxyPort})` : '未启动'}`
+              : '连接中…'}
           </span>
           <span style={{ fontSize: 12, color: '#9ca3af' }}>
             关注 {watchlist.length} · 已采集 {state?.catalogCount ?? 0} · 已下载 {state?.downloadCount ?? 0}
