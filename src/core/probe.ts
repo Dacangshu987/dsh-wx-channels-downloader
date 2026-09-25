@@ -6,6 +6,7 @@
 import { readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { execFile } from 'node:child_process'
+import net from 'node:net'
 import { promisify } from 'node:util'
 import { CA_CN } from '../config.js'
 import { proxyBackupPath } from './paths.js'
@@ -44,6 +45,16 @@ export interface ProbeDeps {
   port: number
   downloadsDir: () => string
   recordsCount: () => number
+  sidecarPort?: number
+}
+
+function portOpen(port: number, host = '127.0.0.1', ms = 700): Promise<boolean> {
+  return new Promise((resolve) => {
+    const s = net.connect(port, host)
+    s.once('connect', () => { s.destroy(); resolve(true) })
+    s.once('error', () => { s.destroy(); resolve(false) })
+    setTimeout(() => { s.destroy(); resolve(false) }, ms)
+  })
 }
 
 export interface ProbeOutput {
@@ -60,12 +71,21 @@ export async function runProbe(deps: ProbeDeps): Promise<ProbeOutput> {
   ])
   const expectServer = `127.0.0.1:${deps.port}`
   const proxySet = proxy.enabled && proxy.server.includes(expectServer)
+  const sidecarPort = deps.sidecarPort
+  const sidecarOk = sidecarPort ? await portOpen(sidecarPort) : undefined
   const items: ProbeItem[] = [
     {
       id: 'wechat',
       label: '微信已安装',
       status: wechatInstalled ? 'ok' : 'fail',
       detail: wechatInstalled ? '已找到微信主程序' : '未找到微信（Weixin.exe / WeChat.exe）',
+    },
+    {
+      id: 'sidecar',
+      label: '进程注入器 (sidecar)',
+      status: sidecarOk === undefined ? 'unknown' : sidecarOk ? 'ok' : 'warn',
+      detail: sidecarOk === undefined ? '未启用（系统代理模式）' : sidecarOk ? `运行中 (127.0.0.1:${sidecarPort})` : '未运行 —— 需要管理员权限启动注入器',
+      fix: sidecarOk === undefined || sidecarOk ? undefined : 'start-sidecar',
     },
     {
       id: 'running',

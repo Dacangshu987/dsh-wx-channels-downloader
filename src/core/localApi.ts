@@ -178,6 +178,7 @@ export function handleLocalApi(ctx: LocalApiContext, req: IncomingMessage, res: 
         if (!ctx.shouldCapture) return true
         return ctx.shouldCapture(v.username || username, v.nickname || body?.author || '')
       })
+      ctx.hub.emitLog(`📥 save_video_list 收到 ${videos.length} 条（接受 ${accepted.length}${accepted.length < videos.length ? `/忽略 ${videos.length - accepted.length}` : ''}，作者=${body?.author || username || '?'}）`)
       const n = ctx.store.saveVideoList(username, body?.author ?? '', accepted)
       for (const v of accepted) {
         ctx.hub.emitCaptured({ ...v, username: v.username || username })
@@ -209,6 +210,7 @@ export function handleLocalApi(ctx: LocalApiContext, req: IncomingMessage, res: 
         createtime: asInt(body.createtime),
       }
       const result = ctx.downloader.enqueue(v, Boolean(body.forceSave))
+      ctx.hub.emitLog(`📥 download_video: ${String(body.title ?? '').slice(0, 30)}（${result.skipped ? '跳过' : result.started ? '已入队' : '未入队'}）`)
       json(res, 200, { success: true, ...result })
     })()
     return true
@@ -236,6 +238,7 @@ export function handleLocalApi(ctx: LocalApiContext, req: IncomingMessage, res: 
         json(res, 400, { success: false, code: -1, message: '视频列表为空' })
         return
       }
+      let queued = 0
       for (const raw of videos) {
         const v: WxVideo = {
           id: String(raw.id ?? ''),
@@ -252,8 +255,12 @@ export function handleLocalApi(ctx: LocalApiContext, req: IncomingMessage, res: 
           duration: asInt(raw.duration ?? raw.durationMs),
           size: asInt(raw.size),
         }
-        if (v.id && v.url) ctx.downloader.enqueue(v, Boolean(body?.forceRedownload))
+        if (v.id && v.url) {
+          ctx.downloader.enqueue(v, Boolean(body?.forceRedownload))
+          queued++
+        }
       }
+      ctx.hub.emitLog(`📥 batch_start 收到 ${videos.length} 条（入队 ${queued}）`)
       json(res, 200, { success: true, code: 0, message: '批量下载已启动' })
     })()
     return true
@@ -309,4 +316,69 @@ export function handleLocalApi(ctx: LocalApiContext, req: IncomingMessage, res: 
   }
 
   return false
+}
+
+/** Captured response of a local-API dispatch (used by the sidecar relay). */
+export interface ApiResponse {
+  status: number
+  headers: Record<string, string>
+  body: string
+}
+
+/**
+ * Dispatch a local-API call without a real HTTP request/response — used by the
+ * Go sidecar relay (/wxchannels/ingest). Returns null when the path is not
+ * handled by the local API.
+ */
+export function dispatchLocalApi(
+  ctx: LocalApiContext,
+  method: string,
+  pathname: string,
+  rawBody: string,
+  headers: Record<string, string> = {},
+): Promise<ApiResponse | null> {
+  return new Promise((resolve) => {
+    let status = 200
+    const outHeaders: Record<string, string> = {}
+    let body = ''
+    let ended = false
+    let done = (): void => {}
+    const finished = new Promise<void>((r) => { done = r })
+    const res = {
+      writeHead(s: number, h?: Record<string, string | number | string[]>): void {
+        status = s
+        if (h) for (const [k, v] of Object.entries(h)) outHeaders[k] = String(v)
+      },
+      end(b?: string | Buffer): void {
+        if (!ended) {
+          ended = true
+          body = String(b ?? '')
+          done()
+        }
+      },
+      write(): boolean { return true },
+    } as unknown as ServerResponse
+    const req = {
+      method,
+      url: pathname,
+      headers,
+      on(_type: string, cb: (...args: unknown[]) => void): unknown {
+        if (_type === 'data') queueMicrotask(() => cb(Buffer.from(rawBody, 'utf8')))
+        if (_type === 'end') queueMicrotask(() => cb())
+        if (_type === 'error') queueMicrotask(() => cb(new Error('closed')))
+        return req
+      },
+    } as unknown as IncomingMessage
+    const handled = handleLocalApi(ctx, req, res)
+    const timeout = setTimeout(() => {
+      if (!ended) {
+        ended = true
+        done()
+      }
+    }, 5000)
+    void finished.then(() => {
+      clearTimeout(timeout)
+      resolve(handled ? { status, headers: outHeaders, body } : null)
+    })
+  })
 }

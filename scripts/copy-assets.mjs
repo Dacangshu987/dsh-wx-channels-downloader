@@ -44,6 +44,12 @@ function copyTree(from, to) {
 
 copyTree(srcDir, destDir)
 
+// Sidecar (Go) embeds the same page scripts for process-level injection.
+const sideAssets = join(pluginRoot, 'sidecar', 'assets', 'inject')
+mkdirSync(sideAssets, { recursive: true })
+cpSync(destDir, sideAssets, { recursive: true })
+console.log('[copy-assets] sidecar inject assets synced ->', sideAssets)
+
 // Page libs (FileSaver / jszip) served same-origin from assets/lib
 const srcLib = join(repoRoot, 'tools', 'nobiyou-src', 'internal', 'assets', 'lib')
 if (existsSync(srcLib)) {

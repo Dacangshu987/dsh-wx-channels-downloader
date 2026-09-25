@@ -551,13 +551,15 @@ function WxChannelsConsole({ onClose }: { onClose: () => void }) {
               </div>
 
               <div style={card}>
-                <div style={cardTitle}>② 启动流程（首次使用按顺序）</div>
+                <div style={cardTitle}>② 启动流程</div>
                 <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-                  <button style={btn} onClick={() => void run('installCert', {}, '证书已安装')} disabled={busy !== null}>1. 安装证书</button>
-                  <button style={btn} onClick={() => void run('setProxy', { on: true }, '代理已设置')} disabled={busy !== null}>2. 设置系统代理</button>
-                  <button style={btn} onClick={() => void run('clearCache', {}, '缓存已清理')} disabled={busy !== null}>3. 清理缓存</button>
-                  <button style={btn} onClick={() => void run('restartWechat', {}, '已重启微信')} disabled={busy !== null}>4. 重启微信</button>
-                  <button style={btn} onClick={() => void run('openChannels', {}, '')} disabled={busy !== null}>5. 打开视频号</button>
+                  <button style={{ ...btnPrimary }} onClick={() => void run('startSidecar', {}, '已请求启动注入器（如弹 UAC 请允许）')} disabled={busy !== null}>
+                    🧬 启动进程注入器（需管理员）
+                  </button>
+                  <span style={{ color: '#9ca3af' }}>（进程注入模式默认开启，可补丁 CDN bundle）</span>
+                  <button style={btn} onClick={() => void run('clearCache', {}, '缓存已清理')} disabled={busy !== null}>清缓存</button>
+                  <button style={btn} onClick={() => void run('restartWechat', {}, '已重启微信')} disabled={busy !== null}>重启微信</button>
+                  <button style={btn} onClick={() => void run('openChannels', {}, '')} disabled={busy !== null}>打开视频号</button>
                 </div>
                 <div style={{ color: '#9ca3af', fontSize: 12, marginTop: 8 }}>归档目录：{state?.downloadsDir ?? '—'}</div>
               </div>
@@ -588,10 +590,10 @@ const th: CSSProperties = { padding: '6px 8px', fontWeight: 500 }
 const td: CSSProperties = { padding: '6px 8px', verticalAlign: 'top' }
 
 function fixCommandOf(fix: string): string {
-  return { 'install-cert': 'installCert', 'set-proxy': 'setProxy', 'clear-cache-restart': 'clearCache' }[fix] ?? 'runProbe'
+  return { 'install-cert': 'installCert', 'set-proxy': 'setProxy', 'clear-cache-restart': 'clearCache', 'start-sidecar': 'startSidecar' }[fix] ?? 'runProbe'
 }
 function fixLabelOf(fix: string): string {
-  return { 'install-cert': '安装证书', 'set-proxy': '设置代理', 'clear-cache-restart': '清理缓存' }[fix] ?? '运行探测'
+  return { 'install-cert': '安装证书', 'set-proxy': '设置代理', 'clear-cache-restart': '清理缓存', 'start-sidecar': '启动进程注入器' }[fix] ?? '运行探测'
 }
 function taskColor(s: string): string {
   return s === 'done' ? '#22c55e' : s === 'failed' ? '#ef4444' : s === 'skipped' ? '#94a3b8' : s === 'downloading' ? '#3b82f6' : '#f59e0b'

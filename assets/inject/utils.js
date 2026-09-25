@@ -237,7 +237,7 @@ var WXU = (() => {
     console.log("[log]", params);
     fetch("/__wx_channels_api/tip", {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-Local-Auth": window.__WX_LOCAL_TOKEN__ || "" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(params),
     });
   }
@@ -326,10 +326,9 @@ var WXU = (() => {
       var profile = format_feed(feed);
       if (!profile) return;
       console.log("[WXU.set_feed] 发送profile到后端", profile.title);
-      var __localHeaders = { "Content-Type": "application/json", "X-Local-Auth": window.__WX_LOCAL_TOKEN__ || "" };
       fetch("/__wx_channels_api/profile", {
         method: "POST",
-        headers: __localHeaders,
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(profile),
       });
       __wx_channels_store__.profile = profile;
@@ -337,7 +336,7 @@ var WXU = (() => {
       __wx_channels_store__.rawProfile = profile;
       fetch("/__wx_channels_api/tip", {
         method: "POST",
-        headers: __localHeaders,
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ msg: "📹 " + (profile.nickname || "未知作者") + " - " + (profile.title || "").substring(0, 30) + "..." })
       }).catch(function () { });
     },

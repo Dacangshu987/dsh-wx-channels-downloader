@@ -4,7 +4,9 @@
  */
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import net from 'node:net'
+import { fileURLToPath } from 'node:url'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { ConfigType } from '../config.js'
 import { CA_CN } from '../config.js'
@@ -21,6 +23,9 @@ import { clearCache, isWechatRunning, launchWechat, stopWechat } from './wechat.
 import { defaultDownloadsDir, recordsDbPath } from './paths.js'
 
 const CHANNELS_HOST = 'channels.weixin.qq.com'
+const SIDECAR_PORT = 2026
+const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+const PLUGIN_ROOT = dirname(fileURLToPath(import.meta.url)) + '/../..'
 
 export interface ServiceDiagnostics {
   proxyRunning: boolean
@@ -58,6 +63,13 @@ export class WxChannelsService {
   async start(): Promise<void> {
     if (process.platform !== 'win32') {
       this.hub.emitLog('⚠️ 本插件仅支持 Windows（依赖 PC 微信 + 系统代理 + Windows 证书存储）')
+      return
+    }
+    if (this.cfg.processInjection) {
+      this.hub.emitLog('🧬 进程注入模式：跳过系统代理 MITM，启动 sidecar 注入器')
+      await this.spawnSidecar()
+      this.hub.emitLog('▶ 打开 PC 微信，进入任一博主主页，即可自动探测视频列表')
+      await this.refreshProbe(true)
       return
     }
     await ensureCa()
@@ -101,13 +113,14 @@ export class WxChannelsService {
       port: this.cfg.port,
       downloadsDir: () => this.downloadsDir,
       recordsCount: () => this.store.listDownloads().length,
+      sidecarPort: this.cfg.processInjection ? SIDECAR_PORT : undefined,
     })
     this.lastProbe = out.result
     if (emit) this.hub.emitProbe(out.result)
     return out.result
   }
 
-  private localApiContext() {
+  localApiContext() {
     return {
       store: this.store,
       downloader: this.downloader,
@@ -133,6 +146,7 @@ export class WxChannelsService {
         return null
       }
       if (ct.includes('javascript') || ct.includes('ecmascript')) {
+        this.hub.emitLog(`🩹 JS 响应经代理: ${pathname} (${body.length}B)`)
         const { content, handled } = this.injector.patchJavaScript(pathname, body.toString('utf8'))
         if (handled) {
           this.hub.emitLog(`🩹 已补丁 JS: ${pathname.includes('virtual') ? 'virtual_svg-icons-register' : pathname.split('/').pop()}`)
@@ -248,6 +262,51 @@ export class WxChannelsService {
     }))
   }
 
+  /** Sidecar（进程级注入器）相关：启动/存活检测。 */
+  private sidecarExe(): string {
+    return join(PLUGIN_ROOT, 'sidecar', 'wxchannels-inject.exe')
+  }
+
+  private portOpen(port: number, host = '127.0.0.1', ms = 800): Promise<boolean> {
+    return new Promise((resolve) => {
+      const s = net.connect(port, host)
+      s.once('connect', () => { s.destroy(); resolve(true) })
+      s.once('error', () => { s.destroy(); resolve(false) })
+      setTimeout(() => { s.destroy(); resolve(false) }, ms)
+    })
+  }
+
+  private async isSidecarAlive(): Promise<boolean> {
+    return this.portOpen(SIDECAR_PORT)
+  }
+
+  private async spawnSidecar(): Promise<void> {
+    const exe = this.sidecarExe()
+    if (!existsSync(exe)) {
+      this.hub.emitLog(`⚠️ 未找到 sidecar 可执行文件: ${exe}（先运行 npm run build）`)
+      return
+    }
+    // 1) 先尝试直接启动（宿主本身已管理员时有效）
+    const child = spawn(exe, ['-p', String(SIDECAR_PORT)], { detached: true, stdio: 'ignore' })
+    child.unref()
+    await delay(1500)
+    if (await this.isSidecarAlive()) {
+      this.hub.emitLog(`✅ sidecar 注入器已运行 (127.0.0.1:${SIDECAR_PORT})`)
+      return
+    }
+    // 2) 未检测到 → 以管理员权限启动（弹出 UAC，请允许）
+    this.hub.emitLog('⏫ sidecar 未检测到监听，将以管理员权限启动（请在 UAC 弹窗中点“是”）')
+    const ps = spawn(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', `Start-Process -Verb RunAs -FilePath '${exe}' -ArgumentList '-p ${SIDECAR_PORT}'`],
+      { detached: true, stdio: 'ignore' },
+    )
+    ps.unref()
+    await delay(2500)
+    if (await this.isSidecarAlive()) this.hub.emitLog(`✅ sidecar 注入器已运行 (127.0.0.1:${SIDECAR_PORT})`)
+    else this.hub.emitLog('⚠️ sidecar 仍未运行：可能 UAC 被拒绝，或杀软拦截；请手动以管理员运行 sidecar/wxchannels-inject.exe')
+  }
+
   /** Client-driven commands. */
   private async ensureStarted(): Promise<void> {
     if (this.proxy) return
@@ -262,6 +321,10 @@ export class WxChannelsService {
           return { ok: true }
         case 'start':
           await this.ensureStarted()
+          return { ok: true }
+        case 'startSidecar':
+          await this.spawnSidecar()
+          await this.refreshProbe(true)
           return { ok: true }
         case 'installCert':
           await ensureCa()

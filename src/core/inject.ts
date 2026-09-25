@@ -107,8 +107,95 @@ function autoShim(): string {
     post('/__wx_channels_api/save_video_list', mapped);
   }
   function schedule() { if (timer) clearTimeout(timer); timer = setTimeout(flush, 1500); }
+  function probeTip(msg) { try { post('/__wx_channels_api/tip', { msg: msg }); } catch (e) {} }
+  function collectorLen() { var c = window.__wx_channels_profile_collector; return (c && c.videos && c.videos.length) || 0; }
+
+  // XHR/fetch 钩子：直接从页面自身的网络响应里抓博主列表/详情 JSON，
+  // 不依赖微信 bundle 是否被打补丁（bundle 走 res.wx.qq.com CDN 时无法注入）。
+  (function () {
+    function addFeeds(feeds, url) {
+      if (!feeds || !feeds.length) return 0;
+      if (typeof WXU === 'undefined' || !WXU.format_feed) return 0;
+      var c = window.__wx_channels_profile_collector;
+      if (!c) return 0;
+      var added = 0;
+      for (var i = 0; i < feeds.length; i++) {
+        try {
+          var p = WXU.format_feed(feeds[i]);
+          if (p && p.id) { c.addVideoFromAPI(p); added++; }
+        } catch (e) {}
+      }
+      if (added) probeTip('[探测] 网络钩子抓到 ' + added + ' 条 / collector=' + collectorLen() + ' (' + String(url).slice(0, 50) + ')');
+      return added;
+    }
+    function extractFeeds(node, depth) {
+      var out = [];
+      if (!node || typeof node !== 'object' || depth > 7) return out;
+      if (Array.isArray(node)) {
+        if (node.length && node[0] && typeof node[0] === 'object' && (node[0].objectDesc || node[0].contact)) return node;
+        for (var i = 0; i < node.length; i++) out = out.concat(extractFeeds(node[i], depth + 1));
+        return out;
+      }
+      for (var k in node) {
+        if (Object.prototype.hasOwnProperty.call(node, k)) out = out.concat(extractFeeds(node[k], depth + 1));
+      }
+      return out;
+    }
+    function jsonHook(body, url) {
+      try {
+        if (!body || typeof body !== 'string' || body.length > 8 * 1024 * 1024) return;
+        var u = String(url || '');
+        if (u.indexOf('/__wx_channels_api/') !== -1) return;
+        if (u.indexOf('finder') === -1 && u.indexOf('mmfinderassistant') === -1 && u.indexOf('feedlist') === -1 && u.indexOf('userpage') === -1 && u.indexOf('feed_list') === -1) return;
+        var obj;
+        try { obj = JSON.parse(body); } catch (e) { return; }
+        var feeds = extractFeeds(obj, 0);
+        if (feeds.length) addFeeds(feeds, u);
+      } catch (e) {}
+    }
+    function hookXhr() {
+      if (!window.XMLHttpRequest) return;
+      var proto = XMLHttpRequest.prototype;
+      if (proto.__wxdownHooked) return;
+      proto.__wxdownHooked = true;
+      var oOpen = proto.open, oSend = proto.send;
+      proto.open = function (m, u) { this.__wxdownUrl = u; return oOpen.apply(this, arguments); };
+      proto.send = function () {
+        var self = this;
+        this.addEventListener('load', function () {
+          try { if (self.responseText) jsonHook(self.responseText, self.__wxdownUrl || ''); } catch (e) {}
+        });
+        return oSend.apply(this, arguments);
+      };
+    }
+    function hookFetch() {
+      var w = window;
+      if (!w.fetch || w.fetch.__wxdownHooked) return;
+      var orig = w.fetch;
+      w.fetch = function (input, init) {
+        var url = typeof input === 'string' ? input : (input && input.url) || '';
+        var p = orig.apply(this, arguments);
+        try {
+          p.then(function (res) {
+            try {
+              if (res && res.ok && res.clone && res.headers && /json/.test(String(res.headers.get('content-type') || ''))) {
+                res.clone().text().then(function (t) { jsonHook(t, url); }).catch(function () {});
+              }
+            } catch (e) {}
+          });
+        } catch (e) {}
+        return p;
+      };
+      w.fetch.__wxdownHooked = true;
+    }
+    hookXhr();
+    hookFetch();
+  })();
   function hook() {
     if (typeof WXE === 'undefined') { setTimeout(hook, 500); return; }
+    WXE.onUserFeedsLoaded(function (feeds) { probeTip('[探测] UserFeedsLoaded ' + ((feeds && feeds.length) || 0) + ' 条 / collector=' + collectorLen()); });
+    WXE.onUserLiveReplayLoaded(function (feeds) { probeTip('[探测] UserLiveReplayLoaded ' + ((feeds && feeds.length) || 0) + ' 条 / collector=' + collectorLen()); });
+    WXE.onInteractionedFeedsLoaded(function (p) { var f = (p && p.feeds) || p || []; probeTip('[探测] InteractionedFeedsLoaded ' + (f.length || 0) + ' 条 / collector=' + collectorLen()); });
     WXE.onUserFeedsLoaded(schedule);
     WXE.onUserLiveReplayLoaded(schedule);
     WXE.onInteractionedFeedsLoaded(schedule);
@@ -286,6 +373,11 @@ export class Injector {
         patch('finderUserPage(loose)', /async\s+finderUserPage\s*\(([^)]+)\)\s*\{(.*?)\}\s*async/gs, (m) => {
           return `async finderUserPage(${m[1]}){var result=await(async()=>{${m[2]}})();if(result&&result.data&&result.data.object){${emit('UserFeedsLoaded', 'result.data.object')}}return result;}async`
         })
+      }
+      if (userPageHits === 0) {
+        const idx = content.indexOf('finderUserPage')
+        if (idx === -1) this.log('🚫 bundle 中未找到 finderUserPage —— 微信已改版或列表函数换名/换 bundle')
+        else this.log('🔎 finderUserPage 存在但未命中，片段: ' + content.slice(Math.max(0, idx - 30), idx + 180))
       }
       const livePageHits = patch('finderLiveUserPage', /async\s+finderLiveUserPage\s*\(([^)]+)\)\s*\{return(.*?)\}\s*async/gs, (m) => {
         return `async finderLiveUserPage(${m[1]}){var result=await(async()=>{return${m[2]}})();if(result&&result.data&&result.data.object){${emit('UserLiveReplayLoaded', 'result.data.object')}}return result;}async`

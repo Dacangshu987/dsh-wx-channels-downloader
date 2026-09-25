@@ -8,6 +8,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
 import { Config, DEFAULT_CONFIG, WXCHANNELS_NAMESPACE, resolveConfig, type ConfigType } from './config.js'
 import { WxChannelsService } from './core/service.js'
+import { dispatchLocalApi } from './core/localApi.js'
 import { WEB_API_PREFIX, type ClientCommand, type ServerEvent } from './shared/protocol.js'
 
 export const name = 'wx-channels-downloader'
@@ -71,6 +72,23 @@ function handleWebApi(svc: WxChannelsService, req: IncomingMessage, res: ServerR
         const payload = typeof cmd === 'string' ? raw?.payload ?? {} : (cmd as { payload?: Record<string, unknown> }).payload ?? {}
         const result = await svc.command(kind, payload)
         sendJson(res, result.ok ? 200 : 400, result)
+        resolve()
+      })()
+      return
+    }
+    if (req.method === 'POST' && pathname === `${WEB_API_PREFIX}/ingest`) {
+      // Go sidecar 进程级拦截中继：把 /__wx_channels_api/* 请求交给本地 API 处理
+      void (async () => {
+        const raw = (await readJson(req)) as { method?: string; path?: string; headers?: Record<string, string>; body?: string }
+        const method = String(raw?.method ?? 'GET')
+        const path = String(raw?.path ?? '/')
+        const body = typeof raw?.body === 'string' ? raw.body : JSON.stringify(raw?.body ?? {})
+        const resp = await dispatchLocalApi(svc.localApiContext(), method, path, body, raw?.headers ?? {})
+        if (!resp) {
+          sendJson(res, 200, { status: 404, headers: {}, body: '{}' })
+          return resolve()
+        }
+        sendJson(res, 200, resp)
         resolve()
       })()
       return
