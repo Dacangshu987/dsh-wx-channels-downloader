@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/qtgolang/SunnyNet/SunnyNet"
@@ -44,7 +45,10 @@ type relayResponse struct {
 // relayToPlugin 把页面脚本的本地 API 调用转发给 DSH 插件处理。
 func relayToPlugin(conn *SunnyNet.HttpConn) bool {
 	path := conn.Request.URL.Path
-	if len(path) < 16 || path[:16] != "/__wx_channels_api/" {
+	// The prefix literal is 19 bytes, so a 16-byte slice could never match it
+	// and every local API call was forwarded to the real server instead of
+	// being relayed to the plugin — the collector's data was silently lost.
+	if !strings.HasPrefix(path, "/__wx_channels_api/") {
 		return false
 	}
 	body, err := io.ReadAll(conn.Request.Body)
@@ -94,12 +98,32 @@ func relayToPlugin(conn *SunnyNet.HttpConn) bool {
 	}
 	conn.StopRequest(rr.Status, rr.Body, h)
 	logln("relay %s %s -> %d (%dB)", conn.Request.Method, path, rr.Status, len(rr.Body))
+	// The page scripts report their采集 diagnostics through /tip and
+	// /inject_health; surface them so the collector's progress is visible.
+	if strings.Contains(path, "/tip") || strings.Contains(path, "/inject_health") {
+		if len(body) > 0 && len(body) < 2048 {
+			logln("  ↳ body: %s", string(body))
+		}
+	}
 	return true
 }
 
 func handleRequest(conn *SunnyNet.HttpConn) {
 	switch conn.Type {
 	case public.HttpSendRequest:
+		// Surface the page's own API traffic so the endpoint that actually
+		// loads a creator's feed list can be identified.
+		if conn.Request != nil && conn.Request.URL != nil {
+			h := strings.ToLower(conn.Request.URL.Hostname())
+			p := conn.Request.URL.Path
+			m := conn.Request.Method
+			if (h == "channels.weixin.qq.com" || strings.Contains(h, "finder")) &&
+				!strings.HasPrefix(p, "/__wx_channels_api/") &&
+				!strings.HasPrefix(p, "/web/pages/") &&
+				!strings.HasPrefix(p, "/web/report") {
+				logln("API %s %s%s", m, h, p)
+			}
+		}
 		if relayToPlugin(conn) {
 			return
 		}

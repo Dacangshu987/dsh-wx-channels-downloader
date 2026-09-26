@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"compress/flate"
+	"compress/gzip"
 	"embed"
 	"fmt"
 	"io"
@@ -179,12 +181,30 @@ const autoShim = `(function () {
   })();
   function hook() {
     if (typeof WXE === 'undefined') { setTimeout(hook, 500); return; }
+    // Report the runtime capabilities that the collector path depends on, so
+    // a missing piece is visible instead of an empty list.
+    try {
+      var caps = {
+        wxe: true,
+        wxu: typeof WXU !== 'undefined',
+        format_feed: !!(typeof WXU !== 'undefined' && WXU.format_feed),
+        collector: !!window.__wx_channels_profile_collector,
+        addVideo: !!(window.__wx_channels_profile_collector && window.__wx_channels_profile_collector.addVideoFromAPI),
+        isListPageFn: typeof __wx_is_profile_like_list_page__ === 'function',
+        isListPage: (typeof __wx_is_profile_like_list_page__ === 'function') ? __wx_is_profile_like_list_page__() : null,
+        path: location.pathname,
+        events: (WXE.Events && Object.keys(WXE.Events).length) || 0
+      };
+      probeTip('[能力] ' + JSON.stringify(caps));
+    } catch (e) { probeTip('[能力] 检查失败 ' + e.message); }
+
     WXE.onUserFeedsLoaded(function (feeds) { probeTip('[探测] UserFeedsLoaded ' + ((feeds && feeds.length) || 0) + ' 条 / collector=' + collectorLen()); });
     WXE.onUserLiveReplayLoaded(function (feeds) { probeTip('[探测] UserLiveReplayLoaded ' + ((feeds && feeds.length) || 0) + ' 条 / collector=' + collectorLen()); });
     WXE.onInteractionedFeedsLoaded(function (p) { var f = (p && p.feeds) || p || []; probeTip('[探测] InteractionedFeedsLoaded ' + (f.length || 0) + ' 条 / collector=' + collectorLen()); });
     WXE.onUserFeedsLoaded(schedule);
     WXE.onUserLiveReplayLoaded(schedule);
     WXE.onInteractionedFeedsLoaded(schedule);
+    probeTip('[能力] 事件监听已注册');
   }
   setTimeout(hook, 0);
   setInterval(function () {
@@ -252,6 +272,73 @@ func buildInjectedScripts(path string) string {
 	return strings.Join(parts, "\n")
 }
 
+// decodeBody undoes the Content-Encoding a client asked for. WeChat requests
+// pages and bundles with "Accept-Encoding: gzip", so the bytes reaching this
+// hook are compressed: searching them for "<head>" or a function name never
+// matches, and the patch silently disappears. Returns the decoded payload and
+// the encoding that was applied (empty when the body was already plain).
+func decodeBody(body []byte, encoding string) ([]byte, string) {
+	enc := strings.ToLower(strings.TrimSpace(encoding))
+	switch {
+	case enc == "" || enc == "identity":
+		return body, ""
+	case strings.Contains(enc, "gzip"):
+		r, err := gzip.NewReader(bytes.NewReader(body))
+		if err != nil {
+			return body, ""
+		}
+		defer r.Close()
+		if dec, err := io.ReadAll(r); err == nil {
+			return dec, "gzip"
+		}
+		return body, ""
+	case strings.Contains(enc, "deflate"):
+		r := flate.NewReader(bytes.NewReader(body))
+		defer r.Close()
+		if dec, err := io.ReadAll(r); err == nil {
+			return dec, "deflate"
+		}
+		return body, ""
+	default:
+		// br / zstd / anything else: leave untouched (we only re-encode what
+		// we can reproduce, and the caller falls back to passthrough).
+		return body, ""
+	}
+}
+
+// encodeBody re-applies an encoding produced by decodeBody.
+func encodeBody(data []byte, encoding string) ([]byte, bool) {
+	switch encoding {
+	case "":
+		return data, true
+	case "gzip":
+		var buf bytes.Buffer
+		w := gzip.NewWriter(&buf)
+		if _, err := w.Write(data); err != nil {
+			return nil, false
+		}
+		if err := w.Close(); err != nil {
+			return nil, false
+		}
+		return buf.Bytes(), true
+	case "deflate":
+		var buf bytes.Buffer
+		w, err := flate.NewWriter(&buf, flate.DefaultCompression)
+		if err != nil {
+			return nil, false
+		}
+		if _, err := w.Write(data); err != nil {
+			return nil, false
+		}
+		if err := w.Close(); err != nil {
+			return nil, false
+		}
+		return buf.Bytes(), true
+	default:
+		return nil, false
+	}
+}
+
 func rewriteResponse(conn *SunnyNet.HttpConn) bool {
 	if conn.Response == nil || conn.Response.Body == nil {
 		return false
@@ -259,35 +346,58 @@ func rewriteResponse(conn *SunnyNet.HttpConn) bool {
 	host := conn.Request.URL.Hostname()
 	path := conn.Request.URL.Path
 	ct := strings.ToLower(conn.Response.Header.Get("content-type"))
-	body, err := io.ReadAll(conn.Response.Body)
+	raw, err := io.ReadAll(conn.Response.Body)
 	if err != nil {
 		return false
 	}
 	_ = conn.Response.Body.Close()
+
+	body, encoding := decodeBody(raw, conn.Response.Header.Get("content-encoding"))
 
 	var out []byte
 	if host == "channels.weixin.qq.com" && strings.Contains(ct, "text/html") {
 		switch path {
 		case "/web/pages/feed", "/web/pages/home", "/web/pages/profile", "/web/pages/account/like":
 			html := string(body)
-			html = strings.Replace(html, "<head>", "<head>\n"+buildInjectedScripts(path), 1)
-			out = []byte(html)
-			logln("注入页面 %s (%dB)", path, len(out))
+			if strings.Contains(html, "<head>") {
+				html = strings.Replace(html, "<head>", "<head>\n"+buildInjectedScripts(path), 1)
+				out = []byte(html)
+				logln("注入页面 %s (%dB, enc=%s)", path, len(out), encoding)
+			} else {
+				logln("⚠️ 注入页面前缀未命中 %s (%dB, enc=%s) —— 响应可能已压缩或结构变化", path, len(body), encoding)
+			}
 		}
 	} else if strings.Contains(ct, "javascript") || strings.Contains(ct, "ecmascript") {
 		if patched, ok := patchBundle(path, string(body)); ok {
 			out = patched
-			logln("补丁JS %s (%dB)", path, len(out))
+			logln("补丁JS %s (%dB, enc=%s)", path, len(out), encoding)
 		}
 	}
 
 	if out == nil {
-		conn.Response.Body = io.NopCloser(bytes.NewReader(body))
+		conn.Response.Body = io.NopCloser(bytes.NewReader(raw))
 		return false
 	}
-	conn.Response.Body = io.NopCloser(bytes.NewReader(out))
-	conn.Response.ContentLength = int64(len(out))
-	conn.Response.Header.Set("Content-Length", fmt.Sprintf("%d", len(out)))
+
+	// Disable caching for patched responses (same as nobiyou's connect.publish
+	// handling): WeChat otherwise serves the pre-patch bundle from its HTTP /
+	// memory cache and the injected code never runs.
+	conn.Response.Header.Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	conn.Response.Header.Set("Pragma", "no-cache")
+	conn.Response.Header.Set("Expires", "0")
+
+	// Re-apply the original encoding so the client can still decode it.
+	final, ok := encodeBody(out, encoding)
+	if !ok {
+		conn.Response.Body = io.NopCloser(bytes.NewReader(raw))
+		return false
+	}
+	conn.Response.Body = io.NopCloser(bytes.NewReader(final))
+	conn.Response.ContentLength = int64(len(final))
+	conn.Response.Header.Set("Content-Length", fmt.Sprintf("%d", len(final)))
+	if len(out) != len(final) {
+		conn.Response.Header.Set("Content-Encoding", encoding)
+	}
 	return true
 }
 
@@ -301,8 +411,33 @@ var (
 	reExportBlock = regexp.MustCompile(`export\s*\{([^}]+)\}`)
 )
 
+// emitJS emits an event on BOTH buses. The injected page scripts listen on
+// WXE (the mitt event bus that profile.js subscribes to via
+// WXE.onUserFeedsLoaded), while WXU is WeChat's own utility object. Preferring
+// WXU alone sent every event to a bus nobody consumed, so the collector stayed
+// empty and the page reported "no video data".
 func emitJS(event, expr string) string {
-	return `var T=window.WXU||window.WXE;if(T&&T.emit){T.emit(T.Events?(T.Events.` + event + `||'` + event + `'):'` + event + `',` + expr + `);}`
+	return `(function(){var v=` + expr + `;` +
+		`try{if(window.WXE&&window.WXE.emit){window.WXE.emit((window.WXE.Events&&window.WXE.Events.` + event + `)||'` + event + `',v);}}catch(e){}` +
+		`try{if(window.WXU&&window.WXU.emit){window.WXU.emit((window.WXU.Events&&window.WXU.Events.` + event + `)||'` + event + `',v);}}catch(e){}` +
+		`})();`
+}
+
+// patchSingleExpr wraps an `async name(args){return <expr>}` method so its
+// resolved value is also emitted on the page event bus. Newer WeChat builds
+// write these endpoints as single-expression bodies (no IIFE), which the
+// patchFunc IIFE/return-anchor patterns do not cover.
+func patchSingleExpr(content, name, event string) string {
+	re := regexp.MustCompile(`(?s)async\s+` + name + `\s*\(([^)]*)\)\s*\{return\s+(.*?)\}\s*async`)
+	return re.ReplaceAllStringFunc(content, func(m string) string {
+		g := re.FindStringSubmatch(m)
+		if g == nil {
+			return m
+		}
+		params, expr := g[1], g[2]
+		return `async ` + name + `(` + params + `){var result=await(` + expr + `);try{if(window.__wx_log){__wx_log({msg:'[补丁] ` + name + ` 返回, n='+((result&&result.data&&(result.data.object||result.data.feedList||result.data.list)&&(result.data.object||result.data.feedList||result.data.list).length)||0)});}}catch(e){}` +
+			`try{var L=(result&&result.data&&(result.data.object||result.data.feedList||result.data.list))||null;if(L&&L.length){` + emitJS(event, "L") + `}}catch(e){}return result;}async`
+	})
 }
 
 // patchFunc 通用：`async name(params){body}async`，带/不带 return 锚点。
@@ -342,16 +477,23 @@ func patchBundle(path, content string) ([]byte, bool) {
 		})
 		before := content
 		content = patchFunc(content, "finderUserPage", true, func(p, b string) string {
-			return `async finderUserPage(` + p + `){var result=await(async()=>{return` + b + `})();if(result&&result.data&&result.data.object){` + emitJS("UserFeedsLoaded", "result.data.object") + `}return result;}async`
+			return `async finderUserPage(` + p + `){var result=await(async()=>{return` + b + `})();try{if(window.__wx_log){__wx_log({msg:'[补丁] finderUserPage 返回, object='+!!(result&&result.data&&result.data.object)+', n='+((result&&result.data&&result.data.object&&result.data.object.length)||0)});}}catch(e){}if(result&&result.data&&result.data.object){` + emitJS("UserFeedsLoaded", "result.data.object") + `}return result;}async`
 		})
 		if content == before {
 			content = patchFunc(content, "finderUserPage", false, func(p, b string) string {
-				return `async finderUserPage(` + p + `){var result=await(async()=>{` + b + `})();if(result&&result.data&&result.data.object){` + emitJS("UserFeedsLoaded", "result.data.object") + `}return result;}async`
+				return `async finderUserPage(` + p + `){var result=await(async()=>{` + b + `})();try{if(window.__wx_log){__wx_log({msg:'[补丁] finderUserPage 返回(loose), object='+!!(result&&result.data&&result.data.object)});}}catch(e){}if(result&&result.data&&result.data.object){` + emitJS("UserFeedsLoaded", "result.data.object") + `}return result;}async`
 			})
 		}
+
+		// WeChat moved the creator-profile feed list onto these endpoints
+		// (FetchFinderMemberFeedList / FinderUserPagePreview). They are written
+		// as single-expression arrow bodies, so wrap the call and emit the
+		// same UserFeedsLoaded event the collector listens for.
+		content = patchSingleExpr(content, "fetchFinderMemberFeedList", "UserFeedsLoaded")
+		content = patchSingleExpr(content, "finderUserPagePreview", "UserFeedsLoaded")
+
 		before = content
-		content = patchFunc(content, "finderLiveUserPage", true, func(p, b string) string {
-			return `async finderLiveUserPage(` + p + `){var result=await(async()=>{return` + b + `})();if(result&&result.data&&result.data.object){` + emitJS("UserLiveReplayLoaded", "result.data.object") + `}return result;}async`
+		content = patchFunc(content, "finderLiveUserPage", true, func(p, b string) string {			return `async finderLiveUserPage(` + p + `){var result=await(async()=>{return` + b + `})();if(result&&result.data&&result.data.object){` + emitJS("UserLiveReplayLoaded", "result.data.object") + `}return result;}async`
 		})
 		if content == before {
 			content = patchFunc(content, "finderLiveUserPage", false, func(p, b string) string {
@@ -375,7 +517,11 @@ func patchBundle(path, content string) ([]byte, bool) {
 			}
 			if len(locals) > 0 {
 				apiMethods := "{" + strings.Join(locals, ",") + "}"
-				js := ";var __wx_emit_api=function(){var T=window.WXU||window.WXE;if(T&&T.emit){T.emit(T.Events?(T.Events.APILoaded||'APILoaded'):'APILoaded'," + apiMethods + ");}};__wx_emit_api();export{"
+				// Same dual-bus rule as emitJS: the page scripts subscribe on WXE.
+				js := ";var __wx_emit_api=function(){var m=" + apiMethods + ";" +
+					"try{if(window.WXE&&window.WXE.emit){window.WXE.emit((window.WXE.Events&&window.WXE.Events.APILoaded)||'APILoaded',m);}}catch(e){}" +
+					"try{if(window.WXU&&window.WXU.emit){window.WXU.emit((window.WXU.Events&&window.WXU.Events.APILoaded)||'APILoaded',m);}}catch(e){}" +
+					"};__wx_emit_api();export{"
 				content = reExport.ReplaceAllString(content, js)
 			}
 		}
