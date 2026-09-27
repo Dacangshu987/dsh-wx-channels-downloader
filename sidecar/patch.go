@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/andybalholm/brotli"
 	"github.com/qtgolang/SunnyNet/SunnyNet"
 )
 
@@ -440,9 +441,16 @@ func decodeBody(body []byte, encoding string) ([]byte, string) {
 			return dec, "deflate"
 		}
 		return body, ""
+	case strings.Contains(enc, "br"):
+		// 关键：微信对 JS bundle 用 brotli 压缩（Content-Encoding: br）。
+		// 之前未处理 → 正则在压缩字节上永远不命中 → 补丁静默失效。
+		if dec, err := io.ReadAll(brotli.NewReader(bytes.NewReader(body))); err == nil {
+			return dec, "br"
+		}
+		return body, ""
 	default:
-		// br / zstd / anything else: leave untouched (we only re-encode what
-		// we can reproduce, and the caller falls back to passthrough).
+		// zstd / anything else: leave untouched (we only re-encode what we can
+		// reproduce, and the caller falls back to passthrough).
 		return body, ""
 	}
 }
@@ -468,6 +476,16 @@ func encodeBody(data []byte, encoding string) ([]byte, bool) {
 		if err != nil {
 			return nil, false
 		}
+		if _, err := w.Write(data); err != nil {
+			return nil, false
+		}
+		if err := w.Close(); err != nil {
+			return nil, false
+		}
+		return buf.Bytes(), true
+	case "br":
+		var buf bytes.Buffer
+		w := brotli.NewWriter(&buf)
 		if _, err := w.Write(data); err != nil {
 			return nil, false
 		}

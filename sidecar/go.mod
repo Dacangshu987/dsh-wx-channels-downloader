@@ -2,7 +2,10 @@ module wxchannels-sidecar
 
 go 1.26.0
 
-require github.com/qtgolang/SunnyNet v1.0.3
+require (
+	github.com/andybalholm/brotli v1.2.5
+	github.com/qtgolang/SunnyNet v1.0.3
+)
 
 require (
 	github.com/Trisia/gosysproxy v1.1.0 // indirect

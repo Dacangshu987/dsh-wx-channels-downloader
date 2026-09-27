@@ -112,6 +112,16 @@ func relayToPlugin(conn *SunnyNet.HttpConn) bool {
 func handleRequest(conn *SunnyNet.HttpConn) {
 	switch conn.Type {
 	case public.HttpSendRequest:
+		// 关键修复：强制 Accept-Encoding: identity，让微信返回明文内容。
+		// 之前 JS bundle 是 brotli(br) 压缩，正则在压缩字节上永不命中 → 补丁静默失效。
+		if conn.Request != nil && conn.Request.Header != nil {
+			if ae := conn.Request.Header.Get("Accept-Encoding"); ae != "" && strings.ToLower(ae) != "identity" {
+				conn.Request.Header.Set("Accept-Encoding", "identity")
+				if conn.Request.URL != nil {
+					debugLog("REQ-AE %s%s : %q -> identity", conn.Request.URL.Hostname(), conn.Request.URL.Path, ae)
+				}
+			}
+		}
 		// Surface the page's own API traffic so the endpoint that actually
 		// loads a creator's feed list can be identified.
 		if conn.Request != nil && conn.Request.URL != nil {
