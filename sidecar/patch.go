@@ -151,6 +151,22 @@ const autoShim = `(function () {
           var item = feeds[i];
           var p = WXU.format_feed(item);
           if (!p && item && item.feed) p = WXU.format_feed(item.feed);
+          if (!p && item && item.id && (item.url || item.originalUrl || item.media)) {
+            var media = item.media || {};
+            p = {
+              id: item.id,
+              title: item.title || item.description || '',
+              url: item.url || item.originalUrl || (media.url + (media.urlToken || '')),
+              key: item.key || media.decodeKey || '',
+              coverUrl: item.coverUrl || media.coverUrl || media.thumbUrl || '',
+              duration: item.duration || media.durationMs || 0,
+              size: item.size || media.fileSize || 0,
+              nickname: item.nickname || (item.contact && item.contact.nickname) || '',
+              username: (item.contact && item.contact.username) || '',
+              createtime: item.createtime || item.create_time || 0,
+              type: 'media',
+            };
+          }
           if (p && p.id) { c.addVideoFromAPI(p); added++; }
         } catch (e) {}
       }
@@ -267,6 +283,11 @@ const autoShim = `(function () {
         try {
           var feeds = extractFeeds(d, 0);
           if (feeds.length) addFeeds(feeds, '[worker]');
+          else {
+            var api = d && d.data && d.data.api ? String(d.data.api) : '';
+            var keys = d && typeof d === 'object' ? Object.keys(d).join(',') : typeof d;
+            if (api) probeTip('[worker] api=' + api + ' keys=' + keys + ' len=' + JSON.stringify(d).length);
+          }
         } catch (e) {}
       };
       var proto = MP.prototype;
