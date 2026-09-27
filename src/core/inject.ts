@@ -121,7 +121,9 @@ function autoShim(): string {
       var added = 0;
       for (var i = 0; i < feeds.length; i++) {
         try {
-          var p = WXU.format_feed(feeds[i]);
+          var item = feeds[i];
+          var p = WXU.format_feed(item);
+          if (!p && item && item.feed) p = WXU.format_feed(item.feed); // wrapper: {feed:{objectDesc…}}
           if (p && p.id) { c.addVideoFromAPI(p); added++; }
         } catch (e) {}
       }
@@ -133,6 +135,9 @@ function autoShim(): string {
       if (!node || typeof node !== 'object' || depth > 7) return out;
       if (Array.isArray(node)) {
         if (node.length && node[0] && typeof node[0] === 'object' && (node[0].objectDesc || node[0].contact)) return node;
+        if (node.length && node[0] && node[0].feed && typeof node[0].feed === 'object' && (node[0].feed.objectDesc || node[0].feed.contact)) {
+          return node.map(function (x) { return x.feed; });
+        }
         for (var i = 0; i < node.length; i++) out = out.concat(extractFeeds(node[i], depth + 1));
         return out;
       }
@@ -141,6 +146,7 @@ function autoShim(): string {
       }
       return out;
     }
+    var seenUrls = {};
     function jsonHook(body, url) {
       try {
         if (!body || typeof body !== 'string' || body.length > 8 * 1024 * 1024) return;
@@ -151,6 +157,7 @@ function autoShim(): string {
         try { obj = JSON.parse(body); } catch (e) { return; }
         var feeds = extractFeeds(obj, 0);
         if (feeds.length) addFeeds(feeds, u);
+        else if (!seenUrls[u] && (seenUrls[u] = true, Object.keys(seenUrls).length < 25)) probeTip('[钩子] ' + u + ' len=' + body.length + ' feeds=0');
       } catch (e) {}
     }
     function hookXhr() {
@@ -190,6 +197,87 @@ function autoShim(): string {
     }
     hookXhr();
     hookFetch();
+    // 通用 API 包装：微信新接口名不可知（FinderUserPagePreview / FetchFinderMemberFeedList…），
+    // 只要结果里有 feed 数组就直接入 collector，不依赖具体函数名。
+    function wrapApiObj(obj) {
+      if (!obj || obj.__wxdownApiWrapped) return;
+      obj.__wxdownApiWrapped = true;
+      Object.keys(obj).forEach(function (k) {
+        var f = obj[k];
+        if (typeof f !== 'function' || f.__wxdownApiWrappedFn) return;
+        f.__wxdownApiWrappedFn = true;
+        obj[k] = function () {
+          var r;
+          try { r = f.apply(this, arguments); } catch (e) { throw e; }
+          try {
+            var handle = function (v) {
+              try {
+                var feeds = extractFeeds(v, 0);
+                if (feeds.length) addFeeds(feeds, '[API] ' + k);
+              } catch (e2) {}
+            };
+            if (r && typeof r.then === 'function') r.then(handle).catch(function () {});
+            else if (r) handle(r);
+          } catch (e3) {}
+          return r;
+        };
+      });
+    }
+    function installApiHooks() {
+      var w = window.WXU;
+      if (w) {
+        try { ['API', 'API2', 'API4'].forEach(function (n) { if (w[n]) wrapApiObj(w[n]); }); } catch (e) {}
+      }
+      var c = window.__wx_channels_profile_collector;
+      if (c && typeof c.init === 'function') { try { c.init(); } catch (e) {} }
+    }
+    setTimeout(function () {
+      try {
+        installApiHooks();
+        if (typeof WXE !== 'undefined') WXE.onAPILoaded(function () { setTimeout(installApiHooks, 100); });
+      } catch (e) {}
+    }, 0);
+    // MessagePort 钩子：视频号列表走 xweb.worker（MessagePort RPC，workerPre 样例：
+    // port.onmessage 里 e.data.data.api 为接口名，数据在 e.data.data 深层）。页面所有
+    // worker 消息必经 MessagePort，深扫每一条消息即可捕获任何接口的 feed 数组。
+    (function () {
+      var MP = window.MessagePort;
+      if (!MP || !MP.prototype) return;
+      var scanData = function (d) {
+        try {
+          var feeds = extractFeeds(d, 0);
+          if (feeds.length) addFeeds(feeds, '[worker]');
+        } catch (e) {}
+      };
+      var proto = MP.prototype;
+      if (!proto.__wxdownPortHooked) {
+        var origAE = proto.addEventListener;
+        proto.addEventListener = function (type, listener, opts) {
+          if (type === 'message' && typeof listener === 'function') {
+            var wrapped = function (ev) {
+              try { scanData(ev && ev.data); } catch (e) {}
+              return listener.apply(this, arguments);
+            };
+            return origAE.call(this, type, wrapped, opts);
+          }
+          return origAE.apply(this, arguments);
+        };
+        try {
+          Object.defineProperty(proto, 'onmessage', {
+            get: function () { return this.__wxdownOm; },
+            set: function (fn) {
+              var self = this;
+              this.__wxdownOm = function (ev) {
+                try { scanData(ev && ev.data); } catch (e) {}
+                if (fn) return fn.apply(self, arguments);
+              };
+            },
+            configurable: true,
+          });
+        } catch (e) {}
+        proto.__wxdownPortHooked = true;
+      }
+    })();
   })();
   function hook() {
     if (typeof WXE === 'undefined') { setTimeout(hook, 500); return; }

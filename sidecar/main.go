@@ -98,6 +98,7 @@ func relayToPlugin(conn *SunnyNet.HttpConn) bool {
 	}
 	conn.StopRequest(rr.Status, rr.Body, h)
 	logln("relay %s %s -> %d (%dB)", conn.Request.Method, path, rr.Status, len(rr.Body))
+	debugLog("RELAY %s %s -> %d (%dB)", conn.Request.Method, path, rr.Status, len(rr.Body))
 	// The page scripts report their采集 diagnostics through /tip and
 	// /inject_health; surface them so the collector's progress is visible.
 	if strings.Contains(path, "/tip") || strings.Contains(path, "/inject_health") {

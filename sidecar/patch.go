@@ -7,11 +7,45 @@ import (
 	"embed"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/qtgolang/SunnyNet/SunnyNet"
 )
+
+// ---- 调试：文件级日志 + bundle/HTML 落盘（提权运行时控制台不可见，必须落盘） ----
+func debugLog(format string, args ...any) {
+	f, err := os.OpenFile(filepath.Join(os.TempDir(), "wxinject.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	line := fmt.Sprintf("[%s] "+format+"\n", append([]any{time.Now().Format("15:04:05")}, args...)...)
+	_, _ = f.WriteString(line)
+	_ = f.Close()
+}
+
+func dumpFile(name string, data []byte) {
+	dir := filepath.Join(os.TempDir(), "wxinject-debug")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) > 80 {
+		for _, e := range entries[:len(entries)-80] {
+			_ = os.Remove(filepath.Join(dir, e.Name()))
+		}
+	}
+	_ = os.WriteFile(filepath.Join(dir, name), data, 0644)
+}
+
+func sanitize(name string) string {
+	name = strings.ReplaceAll(name, "/", "_")
+	name = strings.ReplaceAll(name, "?", "_")
+	return name
+}
 
 var version = "0.1.0"
 
@@ -113,7 +147,12 @@ const autoShim = `(function () {
       if (!c) return 0;
       var added = 0;
       for (var i = 0; i < feeds.length; i++) {
-        try { var p = WXU.format_feed(feeds[i]); if (p && p.id) { c.addVideoFromAPI(p); added++; } } catch (e) {}
+        try {
+          var item = feeds[i];
+          var p = WXU.format_feed(item);
+          if (!p && item && item.feed) p = WXU.format_feed(item.feed);
+          if (p && p.id) { c.addVideoFromAPI(p); added++; }
+        } catch (e) {}
       }
       if (added) probeTip('[探测] 网络钩子抓到 ' + added + ' 条 / collector=' + collectorLen() + ' (' + String(url).slice(0, 50) + ')');
       return added;
@@ -123,12 +162,16 @@ const autoShim = `(function () {
       if (!node || typeof node !== 'object' || depth > 7) return out;
       if (Array.isArray(node)) {
         if (node.length && node[0] && typeof node[0] === 'object' && (node[0].objectDesc || node[0].contact)) return node;
+        if (node.length && node[0] && node[0].feed && typeof node[0].feed === 'object' && (node[0].feed.objectDesc || node[0].feed.contact)) {
+          return node.map(function (x) { return x.feed; });
+        }
         for (var i = 0; i < node.length; i++) out = out.concat(extractFeeds(node[i], depth + 1));
         return out;
       }
       for (var k in node) { if (Object.prototype.hasOwnProperty.call(node, k)) out = out.concat(extractFeeds(node[k], depth + 1)); }
       return out;
     }
+    var seenUrls = {};
     function jsonHook(body, url) {
       try {
         if (!body || typeof body !== 'string' || body.length > 8 * 1024 * 1024) return;
@@ -139,6 +182,7 @@ const autoShim = `(function () {
         try { obj = JSON.parse(body); } catch (e) { return; }
         var feeds = extractFeeds(obj, 0);
         if (feeds.length) addFeeds(feeds, u);
+        else if (!seenUrls[u] && (seenUrls[u] = true, Object.keys(seenUrls).length < 25)) probeTip('[钩子] ' + u + ' len=' + body.length + ' feeds=0');
       } catch (e) {}
     }
     function hookXhr() {
@@ -178,6 +222,82 @@ const autoShim = `(function () {
     }
     hookXhr();
     hookFetch();
+    function wrapApiObj(obj) {
+      if (!obj || obj.__wxdownApiWrapped) return;
+      obj.__wxdownApiWrapped = true;
+      Object.keys(obj).forEach(function (k) {
+        var f = obj[k];
+        if (typeof f !== 'function' || f.__wxdownApiWrappedFn) return;
+        f.__wxdownApiWrappedFn = true;
+        obj[k] = function () {
+          var r;
+          try { r = f.apply(this, arguments); } catch (e) { throw e; }
+          try {
+            var handle = function (v) {
+              try {
+                var feeds = extractFeeds(v, 0);
+                if (feeds.length) addFeeds(feeds, '[API] ' + k);
+              } catch (e2) {}
+            };
+            if (r && typeof r.then === 'function') r.then(handle).catch(function () {});
+            else if (r) handle(r);
+          } catch (e3) {}
+          return r;
+        };
+      });
+    }
+    function installApiHooks() {
+      var w = window.WXU;
+      if (w) {
+        try { ['API', 'API2', 'API4'].forEach(function (n) { if (w[n]) wrapApiObj(w[n]); }); } catch (e) {}
+      }
+      var c = window.__wx_channels_profile_collector;
+      if (c && typeof c.init === 'function') { try { c.init(); } catch (e) {} }
+    }
+    setTimeout(function () {
+      try {
+        installApiHooks();
+        if (typeof WXE !== 'undefined') WXE.onAPILoaded(function () { setTimeout(installApiHooks, 100); });
+      } catch (e) {}
+    }, 0);
+    (function () {
+      var MP = window.MessagePort;
+      if (!MP || !MP.prototype) return;
+      var scanData = function (d) {
+        try {
+          var feeds = extractFeeds(d, 0);
+          if (feeds.length) addFeeds(feeds, '[worker]');
+        } catch (e) {}
+      };
+      var proto = MP.prototype;
+      if (!proto.__wxdownPortHooked) {
+        var origAE = proto.addEventListener;
+        proto.addEventListener = function (type, listener, opts) {
+          if (type === 'message' && typeof listener === 'function') {
+            var wrapped = function (ev) {
+              try { scanData(ev && ev.data); } catch (e) {}
+              return listener.apply(this, arguments);
+            };
+            return origAE.call(this, type, wrapped, opts);
+          }
+          return origAE.apply(this, arguments);
+        };
+        try {
+          Object.defineProperty(proto, 'onmessage', {
+            get: function () { return this.__wxdownOm; },
+            set: function (fn) {
+              var self = this;
+              this.__wxdownOm = function (ev) {
+                try { scanData(ev && ev.data); } catch (e) {}
+                if (fn) return fn.apply(self, arguments);
+              };
+            },
+            configurable: true,
+          });
+        } catch (e) {}
+        proto.__wxdownPortHooked = true;
+      }
+    })();
   })();
   function hook() {
     if (typeof WXE === 'undefined') { setTimeout(hook, 500); return; }
@@ -353,6 +473,13 @@ func rewriteResponse(conn *SunnyNet.HttpConn) bool {
 	_ = conn.Response.Body.Close()
 
 	body, encoding := decodeBody(raw, conn.Response.Header.Get("content-encoding"))
+	debugLog("RESP %s %s ctype=%s len=%d enc=%s", host, path, ct, len(body), encoding)
+	if strings.Contains(ct, "javascript") && strings.Contains(path, "web-finder") {
+		dumpFile(sanitize(path)+".js", body)
+	}
+	if host == "channels.weixin.qq.com" && path == "/web/pages/profile" {
+		dumpFile("profile.html", body)
+	}
 
 	var out []byte
 	if host == "channels.weixin.qq.com" && strings.Contains(ct, "text/html") {
@@ -371,11 +498,13 @@ func rewriteResponse(conn *SunnyNet.HttpConn) bool {
 		if patched, ok := patchBundle(path, string(body)); ok {
 			out = patched
 			logln("补丁JS %s (%dB, enc=%s)", path, len(out), encoding)
+			debugLog("PATCH %s %s -> %dB", host, path, len(out))
 		}
 	}
 
 	if out == nil {
 		conn.Response.Body = io.NopCloser(bytes.NewReader(raw))
+		debugLog("PASSTHROUGH %s %s (unmodified)", host, path)
 		return false
 	}
 
