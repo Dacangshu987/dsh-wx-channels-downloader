@@ -132,9 +132,9 @@ const autoShim = `(function () {
     function jsonHook(body, url) {
       try {
         if (!body || typeof body !== 'string' || body.length > 8 * 1024 * 1024) return;
-        var u = String(url || '');
+        var u = String(url || '').toLowerCase();
         if (u.indexOf('/__wx_channels_api/') !== -1) return;
-        if (u.indexOf('finder') === -1 && u.indexOf('mmfinderassistant') === -1 && u.indexOf('feedlist') === -1 && u.indexOf('userpage') === -1 && u.indexOf('feed_list') === -1) return;
+        if (u.indexOf('finder') === -1 && u.indexOf('mmfinderassistant') === -1 && u.indexOf('feedlist') === -1 && u.indexOf('userpage') === -1 && u.indexOf('feed_list') === -1 && u.indexOf('memberfeed') === -1 && u.indexOf('sph') === -1) return;
         var obj;
         try { obj = JSON.parse(body); } catch (e) { return; }
         var feeds = extractFeeds(obj, 0);
