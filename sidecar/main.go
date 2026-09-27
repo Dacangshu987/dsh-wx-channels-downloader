@@ -163,10 +163,14 @@ func main() {
 		os.Exit(1)
 	}
 	sunny.SetGoCallback(handleRequest, nil, nil, nil)
+	// 同时钩 webview 进程与微信主进程：finder 列表 API 由原生侧（Weixin.exe）发起，
+	// 仅钩 WeChatAppEx 会看不到。
 	sunny.ProcessAddName("WeChatAppEx.exe")
+	sunny.ProcessAddName("Weixin.exe")
+	sunny.ProcessAddName("WeChat.exe")
 	injected := sunny.StartProcess()
 	if injected {
-		logln("✅ 进程注入成功: WeChatAppEx.exe (port %d)", port)
+		logln("✅ 进程注入成功: WeChatAppEx/Weixin/WeChat (port %d)", port)
 	} else {
 		logln("⚠️ 进程注入失败（需要管理员权限）")
 	}
