@@ -685,10 +685,11 @@ func patchBundle(path, content string) ([]byte, bool) {
 		// Cache-busting only; body unchanged.
 		return []byte(content), true
 
-	case strings.Contains(path, "worker") || strings.Contains(content, "postMessage(") || strings.Contains(content, "onmessage"):
+	case strings.Contains(content, "importScripts") || strings.Contains(content, "self.onmessage") || strings.Contains(content, "self.addEventListener('message'"):
 		if !strings.Contains(content, "__wxdownWorkerHooked") {
-			// 观测 worker 出站消息：把每条 postMessage 的结构上报到插件日志。
-			inject := `self.__wxdownPM=(self.postMessage||function(){}).bind(self);self.postMessage=function(d,t){try{var s=(typeof d==='string')?d:JSON.stringify(d);if(s&&s.length<300000){try{fetch('/__wx_channels_api/tip',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({msg:'[worker-out] '+s.slice(0,600)})})}catch(e){}}}catch(e){}return self.__wxdownPM.apply(self,arguments);};`
+			// 仅 worker 上下文生效（typeof window === 'undefined'），主线程 bundle 绝不误伤。
+			// 观测 worker 出站消息：每条 postMessage 的结构上报到插件日志。
+			inject := `if(typeof window==='undefined'){self.__wxdownPM=(self.postMessage||function(){}).bind(self);self.postMessage=function(d,t){try{var s=(typeof d==='string')?d:JSON.stringify(d);if(s&&s.length<300000){try{fetch('/__wx_channels_api/tip',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({msg:'[worker-out] '+s.slice(0,600)})})}catch(e){}}}catch(e){}return self.__wxdownPM.apply(self,arguments);};}`
 			content = inject + content
 			return []byte(content), true
 		}
