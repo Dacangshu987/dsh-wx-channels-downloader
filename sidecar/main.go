@@ -159,7 +159,41 @@ func writeStatus(injected bool, port int, pid int) {
 	_ = os.WriteFile(path, payload, 0644)
 }
 
+// selftest verifies the decode+patch pipeline offline against a captured
+// bundle file: `wxchannels-inject.exe -selftest <file.js>`.
+func selftest(path string) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Println("read failed:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("raw: %d bytes, first16=% X\n", len(raw), raw[:min(16, len(raw))])
+	dec, enc := decodeBody(raw, "br")
+	fmt.Printf("decoded: %d bytes (enc=%q)\n", len(dec), enc)
+	txt := string(dec)
+	for _, p := range []string{"finderUserPage", "fetchFinderMemberFeedList", "finderUserPagePreview", "finderGetCommentDetail", "async ", "export{"} {
+		fmt.Printf("  %-28s : %d\n", p, strings.Count(txt, p))
+	}
+	patched, handled := patchBundle("/t/wx_fed/finder/web/web-finder/res/js/virtual_svg-icons-register"+filepath.Base(path), txt)
+	fmt.Printf("patchBundle: handled=%v, len %d -> %d (delta %+d)\n", handled, len(txt), len(patched), len(patched)-len(txt))
+	ps := string(patched)
+	for _, p := range []string{"UserFeedsLoaded", "__wxdown", "finderUserPage("} {
+		fmt.Printf("  patched contains %-20s : %v\n", p, strings.Contains(ps, p))
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func main() {
+	if len(os.Args) > 2 && os.Args[1] == "-selftest" {
+		selftest(os.Args[2])
+		return
+	}
 	port := 2026
 	if len(os.Args) > 1 && os.Args[1] == "-p" && len(os.Args) > 2 {
 		fmt.Sscanf(os.Args[2], "%d", &port)

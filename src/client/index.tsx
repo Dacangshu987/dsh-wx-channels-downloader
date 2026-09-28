@@ -94,12 +94,21 @@ function groupByAuthor(rows: CatalogRow[]): [string, CatalogRow[]][] {
   return [...m.entries()]
 }
 
-async function cmd(command: string, payload: Record<string, unknown> = {}): Promise<void> {
-  await fetch(`${WEB_API_PREFIX}/cmd`, {
+async function cmd(command: string, payload: Record<string, unknown> = {}): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(`${WEB_API_PREFIX}/cmd`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ command, payload }),
   })
+  const text = await res.text()
+  let data: { ok?: boolean; error?: string } = {}
+  try {
+    data = text ? (JSON.parse(text) as { ok?: boolean; error?: string }) : {}
+  } catch {
+    /* non-JSON body */
+  }
+  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+  return { ok: data.ok !== false, error: data.error }
 }
 
 /* ------------------------------------------------------------------ */
@@ -112,6 +121,7 @@ function WxChannelsConsole({ onClose }: { onClose: () => void }) {
   const [rangeDays, setRangeDays] = useState(0)
   const [busy, setBusy] = useState<string | null>(null)
   const [watchInput, setWatchInput] = useState('')
+  const [errMsg, setErrMsg] = useState('')
   const logRef = useRef<HTMLDivElement>(null)
 
   const refresh = useCallback(async () => {
@@ -168,12 +178,24 @@ function WxChannelsConsole({ onClose }: { onClose: () => void }) {
 
   const run = async (command: string, payload: Record<string, unknown> = {}, label?: string) => {
     setBusy(command)
+    setErrMsg('')
+    const stamp = `[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}]`
     try {
-      await cmd(command, payload)
+      const res = await cmd(command, payload)
+      if (!res.ok) {
+        const m = res.error || '命令执行失败'
+        setErrMsg(m)
+        setLog((l) => [...l, `${stamp} ❌ ${m}`])
+      } else if (label) {
+        setLog((l) => [...l, `${stamp} → ${label}`])
+      }
+    } catch (e) {
+      const m = e instanceof Error ? e.message : String(e)
+      setErrMsg(m)
+      setLog((l) => [...l, `${stamp} ❌ ${m}`])
     } finally {
       setBusy(null)
     }
-    if (label) setLog((l) => [...l, `[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] → ${label}`])
     void refresh()
   }
 
@@ -248,6 +270,29 @@ function WxChannelsConsole({ onClose }: { onClose: () => void }) {
 
         {/* body */}
         <div style={{ flex: 1, overflow: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 14 }}>
+          {errMsg ? (
+            <div
+              style={{
+                background: '#3b1219',
+                border: '1px solid #7f1d1d',
+                color: '#fecaca',
+                borderRadius: 8,
+                padding: '8px 12px',
+                fontSize: 13,
+                display: 'flex',
+                gap: 8,
+                alignItems: 'flex-start',
+              }}
+            >
+              <span style={{ flex: 1 }}>❌ {errMsg}</span>
+              <button
+                onClick={() => setErrMsg('')}
+                style={{ background: 'transparent', border: 'none', color: '#fecaca', cursor: 'pointer', fontSize: 14, lineHeight: 1 }}
+              >
+                ✕
+              </button>
+            </div>
+          ) : null}
           {tab === 'dash' && (
             <>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 10 }}>
